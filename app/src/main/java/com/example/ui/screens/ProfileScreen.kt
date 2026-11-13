@@ -148,7 +148,7 @@ fun ProfileScreen(
                         Text("Kriptografik Kimlik & Düğüm", style = MaterialTheme.typography.titleMedium)
                     }
                     Text(
-                        text = "Hibrit Anahtar Parmak İzi:\n$keyFingerprint",
+                        text = "Cihaz Anahtar Parmak İzi:\n$keyFingerprint",
                         style = MaterialTheme.typography.labelSmall,
                         color = EmeraldVerified
                     )

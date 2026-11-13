@@ -42,6 +42,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -120,16 +121,22 @@ private fun YektaRoot(
     val auth = remember { Firebase.auth }
     val currentUser by auth.authStateFlow().collectAsStateWithLifecycle(initialValue = auth.currentUser)
     val user = currentUser
+    var offlineModeRequested by rememberSaveable { mutableStateOf(false) }
 
-    if (user == null) {
-        AuthScreen(onAuthSuccess = {})
+    if (user == null && !offlineModeRequested) {
+        AuthScreen(
+            onAuthSuccess = {},
+            onContinueOffline = { offlineModeRequested = true }
+        )
     } else {
-        key(user.uid) {
+        val scaffoldKey = user?.uid ?: "offline_p2p_local"
+        key(scaffoldKey) {
             YektaMainScaffold(
-                currentUserId = user.uid,
-                displayName = user.displayName ?: "Yekta Üyesi",
+                currentUserId = user?.uid,
+                displayName = user?.displayName ?: "Yerel Cihaz",
                 isDarkTheme = isDarkTheme,
-                onToggleTheme = onToggleTheme
+                onToggleTheme = onToggleTheme,
+                onRequestCloudSignIn = { offlineModeRequested = false }
             )
         }
     }
@@ -137,20 +144,22 @@ private fun YektaRoot(
 
 @Composable
 private fun YektaMainScaffold(
-    currentUserId: String,
+    currentUserId: String?,
     displayName: String,
     isDarkTheme: Boolean,
-    onToggleTheme: (Boolean) -> Unit
+    onToggleTheme: (Boolean) -> Unit,
+    onRequestCloudSignIn: () -> Unit
 ) {
     val context = LocalContext.current
     val viewModel: YektaViewModel = viewModel(
-        key = currentUserId,
+        key = currentUserId ?: "offline_p2p_local",
         factory = YektaViewModel.Factory(context, currentUserId, displayName)
     )
 
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = backStackEntry?.destination?.route ?: "feed"
+    val startRoute = if (currentUserId == null) "messages" else "feed"
+    val currentRoute = backStackEntry?.destination?.route ?: startRoute
     val snackbarHostState = remember { SnackbarHostState() }
     val bannerMessage by viewModel.actionBanner.collectAsStateWithLifecycle()
 
@@ -227,34 +236,90 @@ private fun YektaMainScaffold(
                 Box(modifier = Modifier.weight(1f).fillMaxSize()) {
                     NavHost(
                         navController = navController,
-                        startDestination = "feed"
+                        startDestination = startRoute
                     ) {
                         composable("feed") {
-                            FeedScreen(
-                                viewModel = viewModel,
-                                onNavigateToCreate = { navigateToTab("create") }
-                            )
+                            if (currentUserId == null) {
+                                OfflineCloudGuard(onRequestCloudSignIn = onRequestCloudSignIn)
+                            } else {
+                                FeedScreen(
+                                    viewModel = viewModel,
+                                    onNavigateToCreate = { navigateToTab("create") }
+                                )
+                            }
                         }
                         composable("create") {
-                            CreatePostScreen(
-                                viewModel = viewModel,
-                                onPostPublished = { navigateToTab("feed") }
-                            )
+                            if (currentUserId == null) {
+                                OfflineCloudGuard(onRequestCloudSignIn = onRequestCloudSignIn)
+                            } else {
+                                CreatePostScreen(
+                                    viewModel = viewModel,
+                                    onPostPublished = { navigateToTab("feed") }
+                                )
+                            }
                         }
                         composable("messages") {
                             MessagesScreen(viewModel = viewModel)
                         }
                         composable("analytics") {
-                            AnalyticsScreen(viewModel = viewModel)
+                            if (currentUserId == null) {
+                                OfflineCloudGuard(onRequestCloudSignIn = onRequestCloudSignIn)
+                            } else {
+                                AnalyticsScreen(viewModel = viewModel)
+                            }
                         }
                         composable("profile") {
-                            ProfileScreen(
-                                viewModel = viewModel,
-                                isDarkTheme = isDarkTheme,
-                                onToggleTheme = onToggleTheme
-                            )
+                            if (currentUserId == null) {
+                                OfflineCloudGuard(onRequestCloudSignIn = onRequestCloudSignIn)
+                            } else {
+                                ProfileScreen(
+                                    viewModel = viewModel,
+                                    isDarkTheme = isDarkTheme,
+                                    onToggleTheme = onToggleTheme
+                                )
+                            }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OfflineCloudGuard(onRequestCloudSignIn: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        contentAlignment = androidx.compose.ui.Alignment.Center
+    ) {
+        androidx.compose.material3.Surface(
+            color = androidx.compose.material3.MaterialTheme.colorScheme.surface,
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
+            modifier = Modifier.fillMaxSize(0.95f).padding(vertical = 32.dp)
+        ) {
+            androidx.compose.foundation.layout.Column(
+                modifier = Modifier.padding(24.dp),
+                verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
+                horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "Çevrimdışı P2P Modu Aktif",
+                    style = androidx.compose.material3.MaterialTheme.typography.headlineSmall
+                )
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 8.dp))
+                Text(
+                    text = "Mesajlar sekmesinden internet olmadan doğrudan Bluetooth LE üzerinden şifreli mesajlaşabilirsiniz. Sosyal akış ve bulut özellikleri için internet bağlantısı ile oturum açın.",
+                    style = androidx.compose.material3.MaterialTheme.typography.bodyMedium,
+                    color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 16.dp))
+                androidx.compose.material3.Button(
+                    onClick = onRequestCloudSignIn,
+                    modifier = Modifier.testTag("switch_to_signin_button")
+                ) {
+                    Text("Google ile Giriş Ekranına Dön")
                 }
             }
         }

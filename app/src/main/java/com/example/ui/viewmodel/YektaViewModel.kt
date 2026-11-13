@@ -24,6 +24,17 @@ import com.example.data.model.UserAccount
 import com.example.data.repository.SemanticAnalysisRepository
 import com.example.data.repository.YektaRepository
 import com.example.network.ProximityP2pManager
+import com.example.p2p.OmniMeshEngineState
+import com.example.p2p.OmniMeshP2pEngine
+import com.example.p2p.crypto.OmniMeshCrypto
+import com.example.p2p.data.LocalMessageEntity
+import com.example.p2p.data.OmniMeshDatabase
+import com.example.p2p.data.OmniMeshLocalRepository
+import com.example.p2p.data.PeerEntity
+import com.example.p2p.identity.DeviceIdentityManager
+import com.example.p2p.transport.BleTransport
+import com.example.p2p.transport.CapabilityDetector
+import com.example.p2p.transport.TransportResult
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
@@ -34,6 +45,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -64,13 +77,17 @@ sealed interface PersonalizationUiState {
 }
 
 class YektaViewModel(
-    private val repository: YektaRepository,
+    private val repository: YektaRepository?,
     private val semanticRepository: SemanticAnalysisRepository,
     val cryptoEngine: YektaCryptoEngine,
     val proximityManager: ProximityP2pManager,
-    val currentUserId: String,
+    val omniMeshEngine: OmniMeshP2pEngine,
+    val capabilityDetector: CapabilityDetector,
+    val currentUserId: String?,
     private val initialDisplayName: String
 ) : ViewModel() {
+
+    val isCloudSignedIn: Boolean get() = currentUserId != null && repository != null
 
     private val _verificationState = MutableStateFlow<VerificationUiState>(VerificationUiState.Idle)
     val verificationState: StateFlow<VerificationUiState> = _verificationState.asStateFlow()
@@ -92,39 +109,129 @@ class YektaViewModel(
 
     val p2pHardwareState: StateFlow<P2pHardwareState> = proximityManager.state
 
-    val userAccount: StateFlow<UiState<UserAccount?>> = repository.observeUserAccount(currentUserId)
-        .asUiState("Hesap bilgileri yüklenemedi")
+    // Real OmniMesh Phase 1 Offline P2P states (zero Firebase dependency)
+    val omniMeshState: StateFlow<OmniMeshEngineState> = omniMeshEngine.engineState
 
-    val postsState: StateFlow<UiState<List<SocialPost>>> = repository.observePublicPosts(currentUserId)
-        .asUiState("Akış yüklenemedi")
+    val savedP2pPeers: StateFlow<List<PeerEntity>> = omniMeshEngine.savedPeersFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val allP2pMessages: StateFlow<List<LocalMessageEntity>> = omniMeshEngine.allMessagesFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    fun observeP2pMessagesForPeer(peerDeviceId: String): Flow<List<LocalMessageEntity>> =
+        omniMeshEngine.observeMessagesForPeer(peerDeviceId)
+
+    val userAccount: StateFlow<UiState<UserAccount?>> =
+        if (repository != null && currentUserId != null) {
+            repository.observeUserAccount(currentUserId).asUiState("Hesap bilgileri yüklenemedi")
+        } else {
+            flowOf<UiState<UserAccount?>>(UiState.Success(null))
+                .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Success(null))
+        }
+
+    val postsState: StateFlow<UiState<List<SocialPost>>> =
+        if (repository != null && currentUserId != null) {
+            repository.observePublicPosts(currentUserId).asUiState("Akış yüklenemedi")
+        } else {
+            flowOf<UiState<List<SocialPost>>>(UiState.Success(emptyList()))
+                .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Success(emptyList()))
+        }
 
     val registryState: StateFlow<UiState<List<ContentRegistryEntry>>> =
-        repository.observeContentRegistry(currentUserId)
-            .asUiState("İçerik kayıtları yüklenemedi")
+        if (repository != null && currentUserId != null) {
+            repository.observeContentRegistry(currentUserId).asUiState("İçerik kayıtları yüklenemedi")
+        } else {
+            flowOf<UiState<List<ContentRegistryEntry>>>(UiState.Success(emptyList()))
+                .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Success(emptyList()))
+        }
 
     val publicProfilesState: StateFlow<UiState<List<PublicProfile>>> =
-        repository.observePublicProfiles(currentUserId)
-            .asUiState("Düğüm rehberi yüklenemedi")
+        if (repository != null && currentUserId != null) {
+            repository.observePublicProfiles(currentUserId).asUiState("Düğüm rehberi yüklenemedi")
+        } else {
+            flowOf<UiState<List<PublicProfile>>>(UiState.Success(emptyList()))
+                .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Success(emptyList()))
+        }
 
     val messagesState: StateFlow<UiState<List<EncryptedMessage>>> =
-        repository.observeEncryptedMessages(currentUserId)
-            .asUiState("Mesajlar yüklenemedi")
+        if (repository != null && currentUserId != null) {
+            repository.observeEncryptedMessages(currentUserId).asUiState("Mesajlar yüklenemedi")
+        } else {
+            flowOf<UiState<List<EncryptedMessage>>>(UiState.Success(emptyList()))
+                .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Success(emptyList()))
+        }
 
     val reportsState: StateFlow<UiState<List<AnalyticsReport>>> =
-        repository.observeAnalyticsReports(currentUserId)
-            .asUiState("Raporlar yüklenemedi")
+        if (repository != null && currentUserId != null) {
+            repository.observeAnalyticsReports(currentUserId).asUiState("Raporlar yüklenemedi")
+        } else {
+            flowOf<UiState<List<AnalyticsReport>>>(UiState.Success(emptyList()))
+                .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Success(emptyList()))
+        }
 
     init {
-        viewModelScope.launch {
-            repository.ensureUserInitialized(
-                uid = currentUserId,
-                displayName = initialDisplayName,
-                publicKeyB64 = cryptoEngine.getPublicKeyBase64(),
-                publicKeyFingerprint = cryptoEngine.getPublicKeyFingerprint(),
-                nodeHexId = cryptoEngine.getKademliaNodeHexId()
-            )
+        if (repository != null && currentUserId != null) {
+            viewModelScope.launch {
+                repository.ensureUserInitialized(
+                    uid = currentUserId,
+                    displayName = initialDisplayName,
+                    publicKeyB64 = cryptoEngine.getPublicKeyBase64(),
+                    publicKeyFingerprint = cryptoEngine.getPublicKeyFingerprint(),
+                    nodeHexId = cryptoEngine.getKademliaNodeHexId()
+                )
+            }
         }
     }
+
+    // --- Real Offline P2P Controls (OmniMesh Phase 1) ---
+
+    fun refreshP2pCapabilities() {
+        omniMeshEngine.refreshCapabilities()
+    }
+
+    fun startP2pDiscovery() {
+        viewModelScope.launch {
+            val res = omniMeshEngine.startDiscovery()
+            if (res is TransportResult.Failure) {
+                _actionBanner.value = res.reason
+            }
+        }
+    }
+
+    fun stopP2pDiscovery() {
+        viewModelScope.launch {
+            omniMeshEngine.stopDiscovery()
+        }
+    }
+
+    fun connectToP2pPeer(address: String) {
+        viewModelScope.launch {
+            when (val res = omniMeshEngine.connectAndEstablishSession(address)) {
+                is TransportResult.Success -> {
+                    _actionBanner.value = "Güvenli oturum kuruldu"
+                }
+                is TransportResult.Failure -> {
+                    _actionBanner.value = res.reason
+                }
+            }
+        }
+    }
+
+    fun sendDirectP2pMessage(peerDeviceId: String?, peerAddress: String?, plaintext: String) {
+        if (plaintext.isBlank()) return
+        viewModelScope.launch {
+            when (val res = omniMeshEngine.sendMessage(peerDeviceId, peerAddress, plaintext)) {
+                is TransportResult.Success -> {
+                    _actionBanner.value = "Şifreli mesaj gönderildi"
+                }
+                is TransportResult.Failure -> {
+                    _actionBanner.value = res.reason
+                }
+            }
+        }
+    }
+
+    // --- Cloud Social Features (Optional when signed in) ---
 
     fun clearBanner() {
         _actionBanner.value = null
@@ -134,8 +241,11 @@ class YektaViewModel(
         _verificationState.value = VerificationUiState.Idle
     }
 
-    fun observeReplies(postId: String): Flow<List<PostReply>> =
-        repository.observePostReplies(postId, currentUserId)
+    fun observeReplies(postId: String): Flow<List<PostReply>> {
+        val repo = repository ?: return emptyFlow()
+        val uid = currentUserId ?: return emptyFlow()
+        return repo.observePostReplies(postId, uid)
+    }
 
     fun verifyDraftUniqueness(
         context: Context,
@@ -143,6 +253,10 @@ class YektaViewModel(
         format: String,
         mediaUri: Uri?
     ) {
+        val repo = repository ?: run {
+            _verificationState.value = VerificationUiState.Error("Bu özellik için giriş yapmanız gerekir.")
+            return
+        }
         if (caption.isBlank()) {
             _verificationState.value = VerificationUiState.Error("Lütfen paylaşım metnini girin.")
             return
@@ -171,7 +285,7 @@ class YektaViewModel(
                 bitmap = bitmap,
                 mediaBytes = mediaBytes,
                 existingEntries = existing,
-                exactHashCheck = { hash -> repository.isExactHashTaken(hash) }
+                exactHashCheck = { hash -> repo.isExactHashTaken(hash) }
             )
 
             result.onSuccess { res ->
@@ -197,10 +311,12 @@ class YektaViewModel(
         verification: UniquenessVerificationResult,
         customTags: List<String>
     ) {
+        val repo = repository ?: return
+        val uid = currentUserId ?: return
         viewModelScope.launch {
             val account = (userAccount.value as? UiState.Success)?.data
             val authorName = account?.displayName ?: initialDisplayName.ifBlank { "Yekta Üyesi" }
-            val authorHandle = account?.handle ?: "yekta_${currentUserId.take(4)}"
+            val authorHandle = account?.handle ?: "yekta_${uid.take(4)}"
 
             val mediaDataUri = withContext(Dispatchers.IO) {
                 if (mediaUri != null && format == "photo") {
@@ -218,7 +334,7 @@ class YektaViewModel(
                 .distinct()
                 .take(6)
 
-            val res = repository.publishUniquePost(
+            val res = repo.publishUniquePost(
                 authorName = authorName,
                 authorHandle = authorHandle,
                 format = format,
@@ -243,95 +359,39 @@ class YektaViewModel(
     }
 
     fun likePost(post: SocialPost) {
+        val repo = repository ?: return
         viewModelScope.launch {
-            repository.incrementLike(post).onFailure {
+            repo.incrementLike(post).onFailure {
                 _actionBanner.value = "Beğeni kaydedilemedi."
             }
         }
     }
 
     fun repostPost(post: SocialPost) {
+        val repo = repository ?: return
         viewModelScope.launch {
-            repository.incrementRepost(post).onFailure {
+            repo.incrementRepost(post).onFailure {
                 _actionBanner.value = "Yeniden paylaşım kaydedilemedi."
             }
         }
     }
 
     fun submitReply(post: SocialPost, text: String) {
+        val repo = repository ?: return
+        val uid = currentUserId ?: return
         if (text.isBlank()) return
         viewModelScope.launch {
             val account = (userAccount.value as? UiState.Success)?.data
             val name = account?.displayName ?: initialDisplayName.ifBlank { "Yekta Üyesi" }
-            val handle = account?.handle ?: "yekta_${currentUserId.take(4)}"
-            repository.addReply(post, name, handle, text.trim()).onFailure {
+            val handle = account?.handle ?: "yekta_${uid.take(4)}"
+            repo.addReply(post, name, handle, text.trim()).onFailure {
                 _actionBanner.value = "Yanıt gönderilemedi."
             }
         }
     }
 
-    fun sendEncryptedMessage(
-        recipient: PublicProfile,
-        plaintext: String,
-        preferOfflineTransport: Boolean
-    ) {
-        if (plaintext.isBlank()) return
-        viewModelScope.launch {
-            val account = (userAccount.value as? UiState.Success)?.data
-            val senderName = account?.displayName ?: initialDisplayName.ifBlank { "Yekta Üyesi" }
-
-            val allPeers = (publicProfilesState.value as? UiState.Success)?.data.orEmpty()
-            val relayKeys = allPeers
-                .filter { it.userId != currentUserId && it.userId != recipient.userId }
-                .take(2)
-                .map { it.publicKeyB64 }
-
-            val envelope = cryptoEngine.encryptForPeer(
-                plaintext = plaintext.trim(),
-                recipientPubKeyB64 = recipient.publicKeyB64,
-                relayPublicKeysB64 = relayKeys
-            )
-
-            val hw = p2pHardwareState.value
-            val mode = if (preferOfflineTransport && hw.discoveredPeers.any { it.transport == "Bluetooth LE" }) {
-                "ble_p2p"
-            } else if (preferOfflineTransport && hw.discoveredPeers.any { it.transport == "Wi-Fi Direct" }) {
-                "wifi_direct"
-            } else {
-                "encrypted_relay"
-            }
-
-            _sentPlaintextCache.value = _sentPlaintextCache.value + (envelope.nonceB64 to plaintext.trim())
-
-            repository.sendEncryptedMessage(
-                recipientId = recipient.userId,
-                senderName = senderName,
-                ciphertext = envelope.ciphertextB64,
-                nonce = envelope.nonceB64,
-                ephemeralPubKey = envelope.ephemeralPubKeyB64,
-                onionHopsCount = envelope.onionHopsCount,
-                transportMode = mode
-            ).onSuccess {
-                _actionBanner.value = "Şifreli paket ${envelope.onionHopsCount} katmanlı rotayla iletildi."
-            }.onFailure { err ->
-                _actionBanner.value = err.localizedMessage ?: "Mesaj gönderilemedi."
-            }
-        }
-    }
-
-    fun decryptMessageText(msg: EncryptedMessage): String {
-        if (msg.senderId == currentUserId && msg.recipientId != currentUserId) {
-            return _sentPlaintextCache.value[msg.nonce]
-                ?: "Şifreli giden paket (${msg.onionHopsCount} katman)"
-        }
-        return cryptoEngine.decryptFromPeer(
-            ciphertextB64 = msg.ciphertext,
-            nonceB64 = msg.nonce,
-            ephemeralPubKeyB64 = msg.ephemeralPubKey
-        ) ?: _sentPlaintextCache.value[msg.nonce] ?: "Şifreli içerik"
-    }
-
     fun generateAnalyticsAndPersonalization() {
+        val repo = repository ?: return
         viewModelScope.launch {
             _personalizationState.value = PersonalizationUiState.Loading
             val posts = (postsState.value as? UiState.Success)?.data.orEmpty()
@@ -349,7 +409,7 @@ class YektaViewModel(
 
             res.onSuccess { insight ->
                 _personalizationState.value = PersonalizationUiState.Ready(insight)
-                repository.saveAnalyticsReport(
+                repo.saveAnalyticsReport(
                     title = "Yekta Özgünlük & Akış Raporu",
                     totalChecked = checked.toLong(),
                     uniqueApproved = posts.size.toLong(),
@@ -372,8 +432,9 @@ class YektaViewModel(
         planTier: String,
         widgets: List<String>
     ) {
+        val repo = repository ?: return
         viewModelScope.launch {
-            repository.updateUserProfileAndPlan(displayName, bio, planTier, widgets)
+            repo.updateUserProfileAndPlan(displayName, bio, planTier, widgets)
                 .onSuccess { _actionBanner.value = "Profil ve panel ayarları güncellendi." }
                 .onFailure { _actionBanner.value = it.localizedMessage ?: "Güncelleme başarısız." }
         }
@@ -431,6 +492,7 @@ class YektaViewModel(
     override fun onCleared() {
         super.onCleared()
         proximityManager.stopDiscovery()
+        omniMeshEngine.release()
     }
 
     private fun <T> Flow<T>.asUiState(fallbackError: String): StateFlow<UiState<T>> =
@@ -495,21 +557,46 @@ class YektaViewModel(
 
     class Factory(
         private val context: Context,
-        private val currentUserId: String,
+        private val currentUserId: String?,
         private val displayName: String
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             val appContext = context.applicationContext
-            val databaseId = appContext.getString(R.string.firestore_database_id)
-            val db = FirebaseFirestore.getInstance(databaseId)
+            val repository = if (currentUserId != null) {
+                val databaseId = appContext.getString(R.string.firestore_database_id)
+                YektaRepository(FirebaseFirestore.getInstance(databaseId))
+            } else {
+                null
+            }
+
             val crypto = YektaCryptoEngine(appContext)
             val p2p = ProximityP2pManager(appContext, crypto.getKademliaNodeHexId())
+
+            val identityManager = DeviceIdentityManager(appContext)
+            val capabilityDetector = CapabilityDetector(appContext)
+            val bleTransport = BleTransport(
+                context = appContext,
+                localShortTag = identityManager.getShortAdvertisingTag(),
+                capabilityDetector = capabilityDetector
+            )
+            val roomDb = OmniMeshDatabase.getInstance(appContext)
+            val localRepo = OmniMeshLocalRepository(roomDb.omniMeshDao())
+            val omniMeshEngine = OmniMeshP2pEngine(
+                identityManager = identityManager,
+                crypto = OmniMeshCrypto(identityManager),
+                primaryTransport = bleTransport,
+                localRepository = localRepo,
+                capabilityDetector = capabilityDetector
+            )
+
             return YektaViewModel(
-                repository = YektaRepository(db),
+                repository = repository,
                 semanticRepository = SemanticAnalysisRepository(),
                 cryptoEngine = crypto,
                 proximityManager = p2p,
+                omniMeshEngine = omniMeshEngine,
+                capabilityDetector = capabilityDetector,
                 currentUserId = currentUserId,
                 initialDisplayName = displayName
             ) as T

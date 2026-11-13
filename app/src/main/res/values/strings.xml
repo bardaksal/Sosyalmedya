@@ -5,10 +5,11 @@
     <string name="feature_unique_title">1x Özgünlük Garantisi</string>
     <string name="feature_unique_desc">Her görsel, video ve metin yalnızca bir kez paylaşılır; kopya içerikler anında engellenir.</string>
     <string name="feature_privacy_title">Uçtan Uca Şifreli İletişim</string>
-    <string name="feature_privacy_desc">Mesajlarınız cihazınızdan çıkmadan çok katmanlı şifrelemeyle korunur.</string>
-    <string name="feature_offline_title">Yakın Ağ ve Çapraz Senkron</string>
-    <string name="feature_offline_desc">Bluetooth ve Wi-Fi Direct ile yakınınızdaki cihazlara ulaşın, çevrimiçi olduğunuzda tüm cihazlarınızla eşitleyin.</string>
+    <string name="feature_privacy_desc">Mesajlarınız cihazınızdan çıkmadan doğrudan oturum anahtarlarıyla şifrelenir.</string>
+    <string name="feature_offline_title">Çevrimdışı Yakın Ağ</string>
+    <string name="feature_offline_desc">İnternet olmadan Bluetooth LE üzerinden yakınınızdaki cihazlarla doğrudan bağlantı kurun.</string>
     <string name="sign_in_google">Google ile Giriş Yap</string>
+    <string name="continue_offline_p2p">Çevrimdışı P2P Mesajlaşmaya Geç</string>
     <string name="free_core_notice">Temel sosyal ağ ve şifreli mesajlaşma %100 ücretsizdir.</string>
 
     <string name="nav_feed">Akış</string>

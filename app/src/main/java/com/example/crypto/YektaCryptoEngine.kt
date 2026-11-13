@@ -81,10 +81,9 @@ class YektaCryptoEngine(context: Context) {
     }
 
     /**
-     * Derives a 256-bit AES session key using ECDH P-256 + HKDF-SHA512 hybrid key expansion
-     * with an ephemeral key capsule for forward secrecy and post-quantum hash strengthening.
+     * Derives a 256-bit AES key using classical ECDH P-256 + HKDF-SHA512.
      */
-    private fun deriveHybridAesKey(
+    private fun deriveClassicEcdhAesKey(
         privateKey: java.security.PrivateKey,
         peerPublicKey: PublicKey,
         contextSalt: ByteArray
@@ -94,26 +93,25 @@ class YektaCryptoEngine(context: Context) {
         ka.doPhase(peerPublicKey, true)
         val sharedSecret = ka.generateSecret()
 
-        // HKDF-Extract & Expand using HMAC-SHA512
         val hmacExtract = Mac.getInstance("HmacSHA512")
         hmacExtract.init(SecretKeySpec(contextSalt, "HmacSHA512"))
         val prk = hmacExtract.doFinal(sharedSecret)
 
         val hmacExpand = Mac.getInstance("HmacSHA512")
         hmacExpand.init(SecretKeySpec(prk, "HmacSHA512"))
-        val info = "YEKTA_HYBRID_PQC_V1".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0x01)
+        val info = "OMNIMESH_ECDH_P256_HKDF_SHA512_V1".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0x01)
         val okm = hmacExpand.doFinal(info)
         return SecretKeySpec(okm.copyOfRange(0, 32), "AES")
     }
 
     /**
-     * Encrypts a message with AES-256-GCM using an ephemeral ECDH keypair and wraps
-     * onion routing metadata hops across intermediate Kademlia peers.
+     * Encrypts a direct payload with classical AES-256-GCM using an ephemeral ECDH keypair.
+     * Multi-hop onion routing is disabled in Phase 1.
      */
     fun encryptForPeer(
         plaintext: String,
         recipientPubKeyB64: String,
-        relayPublicKeysB64: List<String> = emptyList()
+        @Suppress("UNUSED_PARAMETER") relayPublicKeysB64: List<String> = emptyList()
     ): EncryptedEnvelope {
         val kf = KeyFactory.getInstance("EC")
         val recipientKey = kf.generatePublic(
@@ -125,7 +123,7 @@ class YektaCryptoEngine(context: Context) {
         val ephemeralPair = ephemeralKpg.generateKeyPair()
 
         val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
-        val aesKey = deriveHybridAesKey(
+        val aesKey = deriveClassicEcdhAesKey(
             privateKey = ephemeralPair.private,
             peerPublicKey = recipientKey,
             contextSalt = iv
@@ -133,31 +131,13 @@ class YektaCryptoEngine(context: Context) {
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, aesKey, GCMParameterSpec(128, iv))
-        var payloadBytes = cipher.doFinal(plaintext.toByteArray(StandardCharsets.UTF_8))
-
-        // Wrap outer onion routing layers for each selected relay hop (max 3)
-        val hops = relayPublicKeysB64.take(2)
-        for (relayB64 in hops) {
-            runCatching {
-                val relayPub = kf.generatePublic(
-                    X509EncodedKeySpec(Base64.decode(relayB64, Base64.NO_WRAP))
-                )
-                val relayIv = ByteArray(12).also { secureRandom.nextBytes(it) }
-                val relayKey = deriveHybridAesKey(ephemeralPair.private, relayPub, relayIv)
-                val relayCipher = Cipher.getInstance("AES/GCM/NoPadding")
-                relayCipher.init(Cipher.ENCRYPT_MODE, relayKey, GCMParameterSpec(128, relayIv))
-                val wrapped = relayCipher.doFinal(payloadBytes)
-                // Envelope retains outer authenticated tag + hop count metadata
-                payloadBytes = payloadBytes // Keep direct recipient decryptable when relay is online/offline hybrid
-                wrapped.size
-            }
-        }
+        val payloadBytes = cipher.doFinal(plaintext.toByteArray(StandardCharsets.UTF_8))
 
         return EncryptedEnvelope(
             ciphertextB64 = Base64.encodeToString(payloadBytes, Base64.NO_WRAP),
             nonceB64 = Base64.encodeToString(iv, Base64.NO_WRAP),
             ephemeralPubKeyB64 = Base64.encodeToString(ephemeralPair.public.encoded, Base64.NO_WRAP),
-            onionHopsCount = 1 + hops.size
+            onionHopsCount = 1
         )
     }
 
@@ -173,7 +153,7 @@ class YektaCryptoEngine(context: Context) {
             )
             val iv = Base64.decode(nonceB64, Base64.NO_WRAP)
             val ciphertext = Base64.decode(ciphertextB64, Base64.NO_WRAP)
-            val aesKey = deriveHybridAesKey(
+            val aesKey = deriveClassicEcdhAesKey(
                 privateKey = identityKeyPair.private,
                 peerPublicKey = ephemeralPub,
                 contextSalt = iv

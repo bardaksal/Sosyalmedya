@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -26,13 +27,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Hub
+import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -49,44 +48,97 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.crypto.YektaCryptoEngine
-import com.example.data.model.PublicProfile
+import com.example.p2p.OmniMeshP2pEngine
+import com.example.p2p.PeerUiModel
+import com.example.p2p.crypto.SessionState
+import com.example.p2p.data.MessageDeliveryState
+import com.example.p2p.data.MessageDirection
+import com.example.p2p.transport.CapabilityStatus
+import com.example.p2p.transport.PeerConnectionStatus
+import com.example.p2p.transport.TransportType
+import com.example.ui.theme.AmberAlert
 import com.example.ui.theme.EmeraldVerified
-import com.example.ui.viewmodel.UiState
 import com.example.ui.viewmodel.YektaViewModel
+
+private data class SelectedPeerTarget(
+    val deviceId: String?,
+    val address: String?,
+    val displayName: String,
+    val fingerprint: String?
+)
 
 @Composable
 fun MessagesScreen(viewModel: YektaViewModel) {
-    val hwState by viewModel.p2pHardwareState.collectAsStateWithLifecycle()
-    val profilesState by viewModel.publicProfilesState.collectAsStateWithLifecycle()
-    val messagesState by viewModel.messagesState.collectAsStateWithLifecycle()
+    val engineState by viewModel.omniMeshState.collectAsStateWithLifecycle()
+    val savedPeers by viewModel.savedP2pPeers.collectAsStateWithLifecycle()
+    val allMessages by viewModel.allP2pMessages.collectAsStateWithLifecycle()
 
-    var selectedPeer by remember { mutableStateOf<PublicProfile?>(null) }
-    var preferOffline by remember { mutableStateOf(true) }
+    var selectedPeer by remember { mutableStateOf<SelectedPeerTarget?>(null) }
     var draftText by remember { mutableStateOf("") }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        viewModel.proximityManager.refreshHardwareStatus()
+        viewModel.refreshP2pCapabilities()
         if (results.values.any { it }) {
-            viewModel.proximityManager.startDiscoveryAndBroadcast()
+            viewModel.startP2pDiscovery()
         }
     }
 
-    val localNodeHex = remember { viewModel.cryptoEngine.getKademliaNodeHexId() }
+    // Merge discovered live peers with previously verified Room peers
+    val mergedPeers = remember(engineState.peers, savedPeers) {
+        val byAddress = LinkedHashMap<String, PeerUiModel>()
+        engineState.peers.forEach { live ->
+            byAddress[live.address.uppercase()] = live
+        }
+        savedPeers.forEach { saved ->
+            val addr = saved.bleAddress.uppercase()
+            val alreadyLive = byAddress.values.any { it.deviceId == saved.deviceId || (addr.isNotBlank() && it.address == addr) }
+            if (!alreadyLive) {
+                val key = addr.ifBlank { saved.deviceId }
+                byAddress[key] = PeerUiModel(
+                    address = saved.bleAddress,
+                    deviceId = saved.deviceId,
+                    displayName = saved.displayName,
+                    fingerprint = saved.publicKeyFingerprint,
+                    rssi = saved.lastRssi,
+                    transportType = TransportType.BLE,
+                    connectionStatus = PeerConnectionStatus.DISCONNECTED,
+                    sessionState = SessionState.CLOSED,
+                    statusDetail = "Kayıtlı cihaz (çevrimdışı)"
+                )
+            }
+        }
+        byAddress.values.toList()
+    }
 
     if (selectedPeer != null) {
-        val peer = selectedPeer!!
-        val allMessages = (messagesState as? UiState.Success)?.data.orEmpty()
-        val conversation = remember(allMessages, peer.userId) {
-            allMessages.filter {
-                (it.senderId == viewModel.currentUserId && it.recipientId == peer.userId) ||
-                    (it.senderId == peer.userId && it.recipientId == viewModel.currentUserId)
+        BackHandler { selectedPeer = null }
+        val target = selectedPeer!!
+
+        val livePeer = mergedPeers.firstOrNull {
+            (target.deviceId != null && it.deviceId == target.deviceId) ||
+                (!target.address.isNullOrBlank() && it.address.equals(target.address, ignoreCase = true))
+        }
+        val activeDeviceId = livePeer?.deviceId ?: target.deviceId
+        val activeAddress = livePeer?.address?.takeIf { it.isNotBlank() } ?: target.address
+        val sessionState = livePeer?.sessionState
+            ?: viewModel.omniMeshEngine.getSessionStateForPeer(activeAddress, activeDeviceId)
+        val statusLabel = livePeer?.statusDetail ?: when (sessionState) {
+            SessionState.ESTABLISHED -> "Güvenli oturum kuruldu"
+            SessionState.HANDSHAKING -> "Bağlanıyor"
+            SessionState.FAILED -> "Başarısız"
+            SessionState.CLOSED -> "Bağlantı kesildi"
+            SessionState.UNINITIALIZED -> "Hazır"
+        }
+
+        val conversation = remember(allMessages, activeDeviceId, activeAddress) {
+            allMessages.filter { msg ->
+                (activeDeviceId != null && msg.peerDeviceId == activeDeviceId) ||
+                    (!activeAddress.isNullOrBlank() && msg.peerDeviceId.equals(activeAddress, ignoreCase = true))
             }
         }
 
@@ -104,31 +156,38 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
                         IconButton(onClick = { selectedPeer = null }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Geri")
                         }
                         Column {
                             Text(
-                                text = if (peer.userId == viewModel.currentUserId) {
-                                    "${peer.displayName} (Kişisel Kasa)"
-                                } else {
-                                    peer.displayName
-                                },
-                                style = MaterialTheme.typography.titleMedium
+                                text = target.displayName,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+                            val fpText = (livePeer?.fingerprint ?: target.fingerprint)?.take(12)
                             Text(
-                                text = "Anahtar: ${peer.publicKeyFingerprint.take(12)} · Katmanlı Şifreli",
+                                text = if (fpText != null) "$statusLabel · #$fpText" else statusLabel,
                                 style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldVerified
+                                color = if (sessionState == SessionState.ESTABLISHED) EmeraldVerified else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
-                    FilterChip(
-                        selected = preferOffline,
-                        onClick = { preferOffline = !preferOffline },
-                        label = { Text(if (preferOffline) "Yakın Ağ" else "Aktarım") }
-                    )
+
+                    if (sessionState != SessionState.ESTABLISHED && !activeAddress.isNullOrBlank()) {
+                        OutlinedButton(
+                            onClick = { viewModel.connectToP2pPeer(activeAddress) },
+                            modifier = Modifier.testTag("connect_peer_button"),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("Bağlan")
+                        }
+                    }
                 }
             }
 
@@ -157,11 +216,11 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                                     tint = MaterialTheme.colorScheme.primary
                                 )
                                 Text(
-                                    text = "Uçtan Uca Şifreli Kanal Hazır",
+                                    text = "Doğrudan Çevrimdışı Kanal",
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
-                                    text = "Bu sohbete yazılan her ileti gönderilmeden önce cihazınızda şifrelenir ve çok katmanlı rota bilgisiyle korunur.",
+                                    text = "İnternet veya sunucu olmadan Bluetooth LE üzerinden doğrudan güvenli oturum kurularak şifreli mesajlaşılır.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -169,11 +228,8 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                         }
                     }
                 } else {
-                    items(conversation, key = { it.id }) { msg ->
-                        val isMine = msg.senderId == viewModel.currentUserId
-                        val decrypted = remember(msg.id, msg.ciphertext) {
-                            viewModel.decryptMessageText(msg)
-                        }
+                    items(conversation, key = { it.messageId }) { msg ->
+                        val isMine = msg.direction == MessageDirection.OUTGOING.name
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start
@@ -192,20 +248,19 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                                     verticalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     Text(
-                                        text = decrypted,
+                                        text = msg.plaintext,
                                         style = MaterialTheme.typography.bodyLarge,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
-                                        text = "${msg.onionHopsCount} Katman · ${
-                                            when (msg.transportMode) {
-                                                "ble_p2p" -> "Bluetooth LE"
-                                                "wifi_direct" -> "Wi-Fi Direct"
-                                                else -> "Şifreli Aktarım"
-                                            }
-                                        }",
+                                        text = messageStateLabel(msg.state, msg.errorReason),
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        color = when (msg.state) {
+                                            MessageDeliveryState.DELIVERED.name -> EmeraldVerified
+                                            MessageDeliveryState.FAILED.name,
+                                            MessageDeliveryState.EXPIRED.name -> MaterialTheme.colorScheme.error
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
                                     )
                                 }
                             }
@@ -234,7 +289,11 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                 IconButton(
                     onClick = {
                         if (draftText.isNotBlank()) {
-                            viewModel.sendEncryptedMessage(peer, draftText, preferOffline)
+                            viewModel.sendDirectP2pMessage(
+                                peerDeviceId = activeDeviceId,
+                                peerAddress = activeAddress,
+                                plaintext = draftText
+                            )
                             draftText = ""
                         }
                     },
@@ -263,18 +322,18 @@ fun MessagesScreen(viewModel: YektaViewModel) {
         item {
             Column {
                 Text(
-                    text = "Şifreli İletişim & Yakın Ağ",
+                    text = "Çevrimdışı P2P Mesajlaşma",
                     style = MaterialTheme.typography.headlineMedium
                 )
                 Text(
-                    text = "Bluetooth LE, Wi-Fi Direct ve şifreli aktarım ile merkezi sunucu gerektirmeyen gizlilik odaklı mesajlaşma.",
+                    text = "İnternet veya merkezi sunucu olmadan Bluetooth LE ile doğrudan şifreli iletişim.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
 
-        // Hardware Radio & P2P Control Card
+        // Hardware Radio & Capability Control Card
         item {
             Surface(
                 color = MaterialTheme.colorScheme.surface,
@@ -289,53 +348,74 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.WifiTethering,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary
+                        Icon(
+                            imageVector = Icons.Filled.WifiTethering,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Column {
+                            Text("Donanım ve Bağlantı Durumu", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                text = engineState.statusMessage,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Column {
-                                Text("Yakın Donanım Radyosu", style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    text = hwState.statusText,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
                         }
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatusChip(
-                            label = if (hwState.bluetoothEnabled) "Bluetooth Açık" else if (hwState.bluetoothSupported) "Bluetooth Kapalı" else "Bluetooth Yok",
-                            active = hwState.bluetoothEnabled
-                        )
-                        StatusChip(
-                            label = if (hwState.wifiP2pSupported) "Wi-Fi Direct Hazır" else "Wi-Fi Direct Yok",
-                            active = hwState.wifiP2pSupported
-                        )
+                    val caps = engineState.capabilities
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        item {
+                            StatusChip(
+                                label = "BLE: ${OmniMeshP2pEngine.capabilityToTurkish(caps.ble)}",
+                                active = caps.ble == CapabilityStatus.SUPPORTED
+                            )
+                        }
+                        item {
+                            StatusChip(
+                                label = "Wi-Fi Direct: ${OmniMeshP2pEngine.capabilityToTurkish(caps.wifiDirect)}",
+                                active = caps.wifiDirect == CapabilityStatus.SUPPORTED
+                            )
+                        }
+                        item {
+                            StatusChip(
+                                label = "Wi-Fi Aware: ${OmniMeshP2pEngine.capabilityToTurkish(caps.wifiAware)}",
+                                active = caps.wifiAware == CapabilityStatus.SUPPORTED
+                            )
+                        }
                     }
 
                     Text(
-                        text = "Yerel Düğüm Kimliği: #${localNodeHex.take(16).uppercase()}",
+                        text = "Cihaz Kimliği: ${engineState.localIdentity.deviceId.take(18)} · Anahtar #${engineState.localIdentity.publicKeyFingerprint.take(10)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary
                     )
 
+                    if (!engineState.lastSecurityNotice.isNullOrBlank()) {
+                        Surface(
+                            color = AmberAlert.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = engineState.lastSecurityNotice.orEmpty(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AmberAlert,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
                             onClick = {
-                                if (viewModel.proximityManager.hasRequiredPermissions()) {
-                                    viewModel.proximityManager.startDiscoveryAndBroadcast()
+                                if (viewModel.capabilityDetector.hasBlePermissions()) {
+                                    viewModel.startP2pDiscovery()
                                 } else {
-                                    permissionLauncher.launch(viewModel.proximityManager.requiredPermissions())
+                                    permissionLauncher.launch(viewModel.capabilityDetector.requiredBlePermissions())
                                 }
                             },
                             modifier = Modifier
@@ -345,43 +425,14 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                         ) {
                             Icon(Icons.AutoMirrored.Filled.BluetoothSearching, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(if (hwState.isScanning) "Taranıyor..." else "Düğüm Tara")
+                            Text(if (engineState.isScanning) "Taranıyor..." else "Cihaz Tara ve Yayınla")
                         }
-                        if (hwState.isScanning) {
+                        if (engineState.isScanning || engineState.isAdvertising) {
                             OutlinedButton(
-                                onClick = { viewModel.proximityManager.stopDiscovery() },
+                                onClick = { viewModel.stopP2pDiscovery() },
                                 shape = RoundedCornerShape(14.dp)
                             ) {
                                 Text("Durdur")
-                            }
-                        }
-                    }
-
-                    if (hwState.discoveredPeers.isNotEmpty()) {
-                        Text(
-                            text = "Keşfedilen Yakın Cihazlar (${hwState.discoveredPeers.size})",
-                            style = MaterialTheme.typography.labelLarge
-                        )
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(hwState.discoveredPeers, key = { it.id }) { peer ->
-                                Surface(
-                                    color = MaterialTheme.colorScheme.surfaceVariant,
-                                    shape = RoundedCornerShape(12.dp)
-                                ) {
-                                    Column(modifier = Modifier.padding(10.dp)) {
-                                        Text(peer.label, style = MaterialTheme.typography.labelLarge)
-                                        Text(
-                                            text = "${peer.transport} · ${peer.signalStrengthDbm} dBm",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-                                        Text(
-                                            text = "Halka: #${peer.xorDistanceRank}",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
                             }
                         }
                     }
@@ -394,111 +445,114 @@ fun MessagesScreen(viewModel: YektaViewModel) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(Icons.Filled.Hub, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Icon(Icons.Filled.BluetoothConnected, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 Text(
-                    text = "Doğrulanmış Ağ Üyeleri",
+                    text = "Yakındaki ve Kayıtlı Cihazlar (${mergedPeers.size})",
                     style = MaterialTheme.typography.titleLarge
                 )
             }
         }
 
-        when (val pState = profilesState) {
-            is UiState.Loading -> {
-                item {
-                    Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
+        if (mergedPeers.isEmpty()) {
+            item {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Henüz yakın cihaz bulunamadı. İki cihazda da Bluetooth'u açıp 'Cihaz Tara ve Yayınla' butonuna basın.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(16.dp)
+                    )
                 }
             }
-            is UiState.Error -> {
-                item {
-                    Text(pState.message, color = MaterialTheme.colorScheme.error)
-                }
-            }
-            is UiState.Success -> {
-                val sortedPeers = pState.data.sortedBy { peer ->
-                    YektaCryptoEngine.computeXorDistance(localNodeHex, peer.nodeHexId).bucketIndex
-                }
-                if (sortedPeers.isEmpty()) {
-                    item {
-                        Text(
-                            text = "Henüz kayıtlı ağ üyesi bulunamadı.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                } else {
-                    items(sortedPeers, key = { it.userId }) { peer ->
-                        val distance = remember(peer.nodeHexId, localNodeHex) {
-                            YektaCryptoEngine.computeXorDistance(localNodeHex, peer.nodeHexId)
+        } else {
+            items(mergedPeers, key = { it.address.ifBlank { it.deviceId ?: it.displayName } }) { peer ->
+                Surface(
+                    color = MaterialTheme.colorScheme.surface,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                        .clickable {
+                            selectedPeer = SelectedPeerTarget(
+                                deviceId = peer.deviceId,
+                                address = peer.address.takeIf { it.isNotBlank() },
+                                displayName = peer.displayName,
+                                fingerprint = peer.fingerprint
+                            )
                         }
-                        Surface(
-                            color = MaterialTheme.colorScheme.surface,
-                            shape = RoundedCornerShape(16.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
-                                .clickable { selectedPeer = peer }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.weight(1f)
                         ) {
-                            Row(
-                                modifier = Modifier.padding(14.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(44.dp)
-                                            .clip(CircleShape)
-                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Filled.Lock,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.primary
-                                        )
-                                    }
-                                    Column {
-                                        Text(
-                                            text = if (peer.userId == viewModel.currentUserId) {
-                                                "${peer.displayName} (Kişisel Şifreli Kasa)"
-                                            } else {
-                                                peer.displayName
-                                            },
-                                            style = MaterialTheme.typography.titleMedium,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        Text(
-                                            text = "@${peer.handle} · Anahtar #${peer.publicKeyFingerprint.take(8)}",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
-                                Surface(
-                                    color = EmeraldVerified.copy(alpha = 0.14f),
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Text(
-                                        text = "Mesafe ${distance.bucketIndex}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = EmeraldVerified,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                    )
-                                }
+                                Icon(
+                                    imageVector = Icons.Filled.Lock,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
                             }
+                            Column {
+                                Text(
+                                    text = peer.displayName,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = buildString {
+                                        append("BLE · ${peer.rssi} dBm")
+                                        peer.fingerprint?.let { append(" · #${it.take(8)}") }
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        val isSecure = peer.sessionState == SessionState.ESTABLISHED
+                        Surface(
+                            color = if (isSecure) EmeraldVerified.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceVariant,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = peer.statusDetail ?: OmniMeshP2pEngine.statusToTurkish(peer.connectionStatus),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isSecure) EmeraldVerified else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
                         }
                     }
                 }
             }
         }
     }
+}
+
+private fun messageStateLabel(state: String, errorReason: String?): String = when (state) {
+    MessageDeliveryState.CREATED.name -> "Oluşturuldu"
+    MessageDeliveryState.CONNECTING.name -> "Bağlanıyor"
+    MessageDeliveryState.SENT.name -> "Şifreli mesaj gönderildi"
+    MessageDeliveryState.DELIVERED.name -> "İletildi"
+    MessageDeliveryState.EXPIRED.name -> "Süresi doldu"
+    MessageDeliveryState.FAILED.name -> if (errorReason.isNullOrBlank()) "Başarısız" else "Başarısız: $errorReason"
+    else -> state
 }
 
 @Composable
