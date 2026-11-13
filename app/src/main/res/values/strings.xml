@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">Yekta</string>
+    <string name="auth_tagline">Tekil İçerik. Sıfır Taviz Gizlilik.</string>
+    <string name="auth_subtitle">Görsel, kısa video ve anlık düşüncelerinizi tek bir özgür sosyal ağda paylaşın; uçtan uca şifreli iletişim ve yakın ağ aktarımını deneyimleyin.</string>
+    <string name="feature_unique_title">1x Özgünlük Garantisi</string>
+    <string name="feature_unique_desc">Her görsel, video ve metin yalnızca bir kez paylaşılır; kopya içerikler anında engellenir.</string>
+    <string name="feature_privacy_title">Uçtan Uca Şifreli İletişim</string>
+    <string name="feature_privacy_desc">Mesajlarınız cihazınızdan çıkmadan çok katmanlı şifrelemeyle korunur.</string>
+    <string name="feature_offline_title">Yakın Ağ ve Çapraz Senkron</string>
+    <string name="feature_offline_desc">Bluetooth ve Wi-Fi Direct ile yakınınızdaki cihazlara ulaşın, çevrimiçi olduğunuzda tüm cihazlarınızla eşitleyin.</string>
+    <string name="sign_in_google">Google ile Giriş Yap</string>
+    <string name="free_core_notice">Temel sosyal ağ ve şifreli mesajlaşma %100 ücretsizdir.</string>
+
+    <string name="nav_feed">Akış</string>
+    <string name="nav_create">Oluştur</string>
+    <string name="nav_messages">Mesajlar</string>
+    <string name="nav_analytics">Analiz</string>
+    <string name="nav_profile">Profil</string>
+</resources>

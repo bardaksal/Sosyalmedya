@@ -1,0 +1,6 @@
+{
+  "name": "Yekta",
+  "description": "Özgün içerik doğrulamalı, gizlilik odaklı sosyal ağ, şifreli mesajlaşma ve analiz platformu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

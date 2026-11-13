@@ -1,0 +1,157 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Private user account profile, plan tier, cryptographic public key fingerprint, and customizable dashboard widgets.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Firebase Auth UID" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "handle": { "type": "string", "description": "Unique handle" },
+        "bio": { "type": "string", "description": "Profile bio" },
+        "planTier": { "type": "string", "enum": ["ucretsiz", "bireysel_pro", "kurumsal"] },
+        "publicKeyFingerprint": { "type": "string", "description": "ECDH + hybrid key fingerprint" },
+        "dashboardWidgets": { "type": "array", "description": "Selected dashboard widget keys" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp" }
+      },
+      "required": ["userId", "displayName", "handle", "planTier", "publicKeyFingerprint", "createdAt", "updatedAt"]
+    },
+    "PublicProfile": {
+      "title": "PublicProfile",
+      "description": "Non-PII public creator directory entry for peer messaging and social attribution.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "handle": { "type": "string" },
+        "publicKeyB64": { "type": "string" },
+        "publicKeyFingerprint": { "type": "string" },
+        "nodeHexId": { "type": "string" },
+        "visibility": { "type": "string", "enum": ["public"] },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "displayName", "handle", "publicKeyB64", "publicKeyFingerprint", "nodeHexId", "visibility", "updatedAt"]
+    },
+    "SocialPost": {
+      "title": "SocialPost",
+      "description": "1x verified unique social post combining photo, short video, or microblog text.",
+      "type": "object",
+      "properties": {
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorHandle": { "type": "string" },
+        "format": { "type": "string", "enum": ["photo", "video", "text"] },
+        "caption": { "type": "string" },
+        "mediaDataUri": { "type": "string" },
+        "tags": { "type": "array" },
+        "contentHash": { "type": "string" },
+        "perceptualHash": { "type": "string" },
+        "uniquenessScore": { "type": "integer" },
+        "semanticSummary": { "type": "string" },
+        "visibility": { "type": "string", "enum": ["public"] },
+        "likeCount": { "type": "integer" },
+        "repostCount": { "type": "integer" },
+        "replyCount": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["authorId", "authorName", "authorHandle", "format", "caption", "contentHash", "perceptualHash", "uniquenessScore", "semanticSummary", "visibility", "likeCount", "repostCount", "replyCount", "createdAt", "updatedAt"]
+    },
+    "PostReply": {
+      "title": "PostReply",
+      "description": "Reply to a 1x verified social post.",
+      "type": "object",
+      "properties": {
+        "authorId": { "type": "string" },
+        "authorName": { "type": "string" },
+        "authorHandle": { "type": "string" },
+        "text": { "type": "string" },
+        "visibility": { "type": "string", "enum": ["public"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["authorId", "authorName", "authorHandle", "text", "visibility", "createdAt"]
+    },
+    "ContentRegistryEntry": {
+      "title": "ContentRegistryEntry",
+      "description": "Global 1x cryptographic and semantic content deduplication ledger.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string" },
+        "postId": { "type": "string" },
+        "contentHash": { "type": "string" },
+        "perceptualHash": { "type": "string" },
+        "format": { "type": "string", "enum": ["photo", "video", "text"] },
+        "semanticSummary": { "type": "string" },
+        "textPreview": { "type": "string" },
+        "visibility": { "type": "string", "enum": ["public"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "postId", "contentHash", "perceptualHash", "format", "semanticSummary", "textPreview", "visibility", "createdAt"]
+    },
+    "EncryptedMessage": {
+      "title": "EncryptedMessage",
+      "description": "End-to-end encrypted and onion-routed peer message.",
+      "type": "object",
+      "properties": {
+        "senderId": { "type": "string" },
+        "recipientId": { "type": "string" },
+        "participantIds": { "type": "array" },
+        "senderName": { "type": "string" },
+        "ciphertext": { "type": "string" },
+        "nonce": { "type": "string" },
+        "ephemeralPubKey": { "type": "string" },
+        "onionHopsCount": { "type": "integer" },
+        "transportMode": { "type": "string", "enum": ["ble_p2p", "wifi_direct", "encrypted_relay"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["senderId", "recipientId", "participantIds", "senderName", "ciphertext", "nonce", "ephemeralPubKey", "onionHopsCount", "transportMode", "createdAt"]
+    },
+    "AnalyticsReport": {
+      "title": "AnalyticsReport",
+      "description": "Saved uniqueness, similarity, and network report for user analytics dashboard.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "totalChecked": { "type": "integer" },
+        "uniqueApproved": { "type": "integer" },
+        "duplicatesBlocked": { "type": "integer" },
+        "avgSimilarityScore": { "type": "integer" },
+        "recommendationsSummary": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "totalChecked", "uniqueApproved", "duplicatesBlocked", "avgSimilarityScore", "recommendationsSummary", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Private user account profile and dashboard customization"
+    },
+    "/users/{userId}/analytics_reports/{reportId}": {
+      "schema": { "$ref": "#/entities/AnalyticsReport" },
+      "description": "User-scoped analytics and exportable verification reports"
+    },
+    "/public_profiles/{profileId}": {
+      "schema": { "$ref": "#/entities/PublicProfile" },
+      "description": "Public creator handle, node ID, and ECDH public key directory"
+    },
+    "/posts/{postId}": {
+      "schema": { "$ref": "#/entities/SocialPost" },
+      "description": "Global 1x unique social feed posts"
+    },
+    "/posts/{postId}/replies/{replyId}": {
+      "schema": { "$ref": "#/entities/PostReply" },
+      "description": "Replies under a social post"
+    },
+    "/content_registry/{hashId}": {
+      "schema": { "$ref": "#/entities/ContentRegistryEntry" },
+      "description": "Immutable 1x content hash and semantic ledger"
+    },
+    "/encrypted_messages/{messageId}": {
+      "schema": { "$ref": "#/entities/EncryptedMessage" },
+      "description": "Participant-isolated encrypted peer messages"
+    }
+  }
+}

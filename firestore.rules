@@ -1,0 +1,274 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidTimestamp(ts) {
+      return ts is timestamp && ts <= request.time;
+    }
+
+    function isValidUserAccount(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 60 &&
+             data.handle is string && data.handle.size() >= 2 && data.handle.size() <= 30 &&
+             (!('bio' in data) || (data.bio is string && data.bio.size() <= 240)) &&
+             data.planTier in ['ucretsiz', 'bireysel_pro', 'kurumsal'] &&
+             data.publicKeyFingerprint is string && data.publicKeyFingerprint.size() >= 8 && data.publicKeyFingerprint.size() <= 128 &&
+             (!('dashboardWidgets' in data) || (
+               data.dashboardWidgets is list &&
+               data.dashboardWidgets.size() <= 8 &&
+               (data.dashboardWidgets.size() == 0 || data.dashboardWidgets[0] is string)
+             ));
+    }
+
+    function isValidPublicProfile(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 60 &&
+             data.handle is string && data.handle.size() >= 2 && data.handle.size() <= 30 &&
+             data.publicKeyB64 is string && data.publicKeyB64.size() >= 16 && data.publicKeyB64.size() <= 512 &&
+             data.publicKeyFingerprint is string && data.publicKeyFingerprint.size() >= 8 && data.publicKeyFingerprint.size() <= 128 &&
+             data.nodeHexId is string && data.nodeHexId.size() >= 16 && data.nodeHexId.size() <= 64 &&
+             data.visibility == 'public';
+    }
+
+    function isValidSocialPost(data) {
+      return data.authorId is string && data.authorId.size() >= 1 && data.authorId.size() <= 128 &&
+             data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 60 &&
+             data.authorHandle is string && data.authorHandle.size() >= 2 && data.authorHandle.size() <= 30 &&
+             data.format in ['photo', 'video', 'text'] &&
+             data.caption is string && data.caption.size() >= 1 && data.caption.size() <= 1000 &&
+             (!('mediaDataUri' in data) || (data.mediaDataUri is string && data.mediaDataUri.size() <= 350000)) &&
+             (!('tags' in data) || (
+               data.tags is list &&
+               data.tags.size() <= 8 &&
+               (data.tags.size() == 0 || data.tags[0] is string)
+             )) &&
+             data.contentHash is string && data.contentHash.size() >= 16 && data.contentHash.size() <= 128 &&
+             data.perceptualHash is string && data.perceptualHash.size() >= 8 && data.perceptualHash.size() <= 128 &&
+             data.uniquenessScore is int && data.uniquenessScore >= 0 && data.uniquenessScore <= 100 &&
+             data.semanticSummary is string && data.semanticSummary.size() >= 1 && data.semanticSummary.size() <= 300 &&
+             data.visibility == 'public' &&
+             data.likeCount is int && data.likeCount >= 0 &&
+             data.repostCount is int && data.repostCount >= 0 &&
+             data.replyCount is int && data.replyCount >= 0;
+    }
+
+    function isValidPostReply(data) {
+      return data.authorId is string && data.authorId.size() >= 1 && data.authorId.size() <= 128 &&
+             data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 60 &&
+             data.authorHandle is string && data.authorHandle.size() >= 2 && data.authorHandle.size() <= 30 &&
+             data.text is string && data.text.size() >= 1 && data.text.size() <= 500 &&
+             data.visibility == 'public';
+    }
+
+    function isValidContentRecord(data) {
+      return data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 &&
+             data.postId is string && data.postId.size() >= 1 && data.postId.size() <= 128 &&
+             data.contentHash is string && data.contentHash.size() >= 16 && data.contentHash.size() <= 128 &&
+             data.perceptualHash is string && data.perceptualHash.size() >= 8 && data.perceptualHash.size() <= 128 &&
+             data.format in ['photo', 'video', 'text'] &&
+             data.semanticSummary is string && data.semanticSummary.size() >= 1 && data.semanticSummary.size() <= 300 &&
+             data.textPreview is string && data.textPreview.size() >= 1 && data.textPreview.size() <= 200 &&
+             data.visibility == 'public';
+    }
+
+    function isValidEncryptedMessage(data) {
+      return data.senderId is string && data.senderId.size() >= 1 && data.senderId.size() <= 128 &&
+             data.recipientId is string && data.recipientId.size() >= 1 && data.recipientId.size() <= 128 &&
+             data.participantIds is list && data.participantIds.size() == 2 &&
+             data.senderId in data.participantIds &&
+             data.recipientId in data.participantIds &&
+             data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 60 &&
+             data.ciphertext is string && data.ciphertext.size() >= 1 && data.ciphertext.size() <= 8192 &&
+             data.nonce is string && data.nonce.size() >= 8 && data.nonce.size() <= 128 &&
+             data.ephemeralPubKey is string && data.ephemeralPubKey.size() >= 16 && data.ephemeralPubKey.size() <= 512 &&
+             data.onionHopsCount is int && data.onionHopsCount >= 1 && data.onionHopsCount <= 8 &&
+             data.transportMode in ['ble_p2p', 'wifi_direct', 'encrypted_relay'];
+    }
+
+    function isValidAnalyticsReport(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+             data.totalChecked is int && data.totalChecked >= 0 &&
+             data.uniqueApproved is int && data.uniqueApproved >= 0 &&
+             data.duplicatesBlocked is int && data.duplicatesBlocked >= 0 &&
+             data.avgSimilarityScore is int && data.avgSimilarityScore >= 0 && data.avgSimilarityScore <= 100 &&
+             data.recommendationsSummary is string && data.recommendationsSummary.size() >= 1 && data.recommendationsSummary.size() <= 1500;
+    }
+
+    match /users/{userId} {
+      allow get, list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       request.auth.uid == userId &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().keys().hasAll(['userId', 'displayName', 'handle', 'planTier', 'publicKeyFingerprint', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'displayName', 'handle', 'bio', 'planTier', 'publicKeyFingerprint', 'dashboardWidgets', 'createdAt', 'updatedAt']) &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidTimestamp(incoming().updatedAt) &&
+                       isValidUserAccount(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(userId) &&
+                       request.auth.uid == userId &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidTimestamp(incoming().updatedAt) &&
+                       isValidUserAccount(incoming()) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'handle', 'bio', 'planTier', 'publicKeyFingerprint', 'dashboardWidgets', 'updatedAt']);
+
+      allow delete: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+
+      match /analytics_reports/{reportId} {
+        allow get: if isSignedIn() && isValidId(reportId) && request.auth.uid == userId;
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         isValidId(userId) &&
+                         isValidId(reportId) &&
+                         request.auth.uid == userId &&
+                         incoming().userId == request.auth.uid &&
+                         incoming().keys().hasAll(['userId', 'title', 'totalChecked', 'uniqueApproved', 'duplicatesBlocked', 'avgSimilarityScore', 'recommendationsSummary', 'createdAt']) &&
+                         incoming().keys().hasOnly(['userId', 'title', 'totalChecked', 'uniqueApproved', 'duplicatesBlocked', 'avgSimilarityScore', 'recommendationsSummary', 'createdAt']) &&
+                         isValidTimestamp(incoming().createdAt) &&
+                         isValidAnalyticsReport(incoming());
+
+        allow update: if false;
+        allow delete: if isSignedIn() && isValidId(reportId) && request.auth.uid == userId;
+      }
+    }
+
+    match /public_profiles/{profileId} {
+      allow get: if isSignedIn() && isValidId(profileId);
+      allow list: if isSignedIn() && existing().visibility == 'public';
+
+      allow create: if isSignedIn() &&
+                       isValidId(profileId) &&
+                       request.auth.uid == profileId &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().keys().hasAll(['userId', 'displayName', 'handle', 'publicKeyB64', 'publicKeyFingerprint', 'nodeHexId', 'visibility', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'displayName', 'handle', 'publicKeyB64', 'publicKeyFingerprint', 'nodeHexId', 'visibility', 'updatedAt']) &&
+                       isValidTimestamp(incoming().updatedAt) &&
+                       isValidPublicProfile(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(profileId) &&
+                       request.auth.uid == profileId &&
+                       incoming().userId == existing().userId &&
+                       isValidTimestamp(incoming().updatedAt) &&
+                       isValidPublicProfile(incoming()) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'handle', 'publicKeyB64', 'publicKeyFingerprint', 'nodeHexId', 'updatedAt']);
+
+      allow delete: if isSignedIn() && isValidId(profileId) && request.auth.uid == profileId;
+    }
+
+    match /posts/{postId} {
+      allow get: if isSignedIn() && isValidId(postId);
+      allow list: if isSignedIn() && existing().visibility == 'public';
+
+      allow create: if isSignedIn() &&
+                       isValidId(postId) &&
+                       incoming().authorId == request.auth.uid &&
+                       incoming().keys().hasAll(['authorId', 'authorName', 'authorHandle', 'format', 'caption', 'contentHash', 'perceptualHash', 'uniquenessScore', 'semanticSummary', 'visibility', 'likeCount', 'repostCount', 'replyCount', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['authorId', 'authorName', 'authorHandle', 'format', 'caption', 'mediaDataUri', 'tags', 'contentHash', 'perceptualHash', 'uniquenessScore', 'semanticSummary', 'visibility', 'likeCount', 'repostCount', 'replyCount', 'createdAt', 'updatedAt']) &&
+                       incoming().likeCount == 0 &&
+                       incoming().repostCount == 0 &&
+                       incoming().replyCount == 0 &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidTimestamp(incoming().updatedAt) &&
+                       isValidSocialPost(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(postId) &&
+                       isValidSocialPost(incoming()) &&
+                       incoming().authorId == existing().authorId &&
+                       incoming().contentHash == existing().contentHash &&
+                       incoming().perceptualHash == existing().perceptualHash &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidTimestamp(incoming().updatedAt) &&
+                       (
+                         (existing().authorId == request.auth.uid &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['caption', 'tags', 'updatedAt'])) ||
+                         (incoming().diff(existing()).affectedKeys().hasOnly(['likeCount', 'updatedAt']) &&
+                          incoming().likeCount == existing().likeCount + 1) ||
+                         (incoming().diff(existing()).affectedKeys().hasOnly(['repostCount', 'updatedAt']) &&
+                          incoming().repostCount == existing().repostCount + 1) ||
+                         (incoming().diff(existing()).affectedKeys().hasOnly(['replyCount', 'updatedAt']) &&
+                          incoming().replyCount == existing().replyCount + 1)
+                       );
+
+      allow delete: if isSignedIn() && isValidId(postId) && existing().authorId == request.auth.uid;
+
+      match /replies/{replyId} {
+        allow get: if isSignedIn() && isValidId(postId) && isValidId(replyId);
+        allow list: if isSignedIn() && existing().visibility == 'public';
+
+        allow create: if isSignedIn() &&
+                         isValidId(postId) &&
+                         isValidId(replyId) &&
+                         exists(/databases/$(database)/documents/posts/$(postId)) &&
+                         incoming().authorId == request.auth.uid &&
+                         incoming().keys().hasAll(['authorId', 'authorName', 'authorHandle', 'text', 'visibility', 'createdAt']) &&
+                         incoming().keys().hasOnly(['authorId', 'authorName', 'authorHandle', 'text', 'visibility', 'createdAt']) &&
+                         isValidTimestamp(incoming().createdAt) &&
+                         isValidPostReply(incoming());
+
+        allow update: if false;
+        allow delete: if isSignedIn() && isValidId(postId) && isValidId(replyId) && existing().authorId == request.auth.uid;
+      }
+    }
+
+    match /content_registry/{hashId} {
+      allow get: if isSignedIn() && isValidId(hashId);
+      allow list: if isSignedIn() && existing().visibility == 'public';
+
+      allow create: if isSignedIn() &&
+                       isValidId(hashId) &&
+                       incoming().ownerId == request.auth.uid &&
+                       incoming().contentHash == hashId &&
+                       incoming().keys().hasAll(['ownerId', 'postId', 'contentHash', 'perceptualHash', 'format', 'semanticSummary', 'textPreview', 'visibility', 'createdAt']) &&
+                       incoming().keys().hasOnly(['ownerId', 'postId', 'contentHash', 'perceptualHash', 'format', 'semanticSummary', 'textPreview', 'visibility', 'createdAt']) &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidContentRecord(incoming());
+
+      allow update: if false;
+      allow delete: if isSignedIn() && isValidId(hashId) && existing().ownerId == request.auth.uid;
+    }
+
+    match /encrypted_messages/{messageId} {
+      allow get: if isSignedIn() && isValidId(messageId) && request.auth.uid in existing().participantIds;
+      allow list: if isSignedIn() && request.auth.uid in existing().participantIds;
+
+      allow create: if isSignedIn() &&
+                       isValidId(messageId) &&
+                       incoming().senderId == request.auth.uid &&
+                       request.auth.uid in incoming().participantIds &&
+                       incoming().keys().hasAll(['senderId', 'recipientId', 'participantIds', 'senderName', 'ciphertext', 'nonce', 'ephemeralPubKey', 'onionHopsCount', 'transportMode', 'createdAt']) &&
+                       incoming().keys().hasOnly(['senderId', 'recipientId', 'participantIds', 'senderName', 'ciphertext', 'nonce', 'ephemeralPubKey', 'onionHopsCount', 'transportMode', 'createdAt']) &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidEncryptedMessage(incoming());
+
+      allow update, delete: if false;
+    }
+  }
+}
