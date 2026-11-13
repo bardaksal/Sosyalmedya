@@ -20,8 +20,13 @@ import com.example.p2p.forwarding.ForwardingEngine
 import com.example.p2p.forwarding.InMemoryDuplicateMessageCache
 import com.example.p2p.identity.DeviceIdentity
 import com.example.p2p.identity.DeviceIdentityManager
-import com.example.p2p.routing.DirectPeerNextHopResolver
+import com.example.p2p.routing.KademliaConfig
+import com.example.p2p.routing.KademliaNextHopResolver
+import com.example.p2p.routing.KademliaRoutingTable
 import com.example.p2p.routing.NextHopResolver
+import com.example.p2p.routing.RoutingNodeEntry
+import com.example.p2p.routing.RoutingNodeId
+import com.example.p2p.routing.RoutingTrustState
 import com.example.p2p.transport.CapabilityDetector
 import com.example.p2p.transport.CapabilityStatus
 import com.example.p2p.transport.DeviceTransportCapabilities
@@ -112,12 +117,28 @@ class OmniMeshP2pEngine(
     private val pendingHandshakes = ConcurrentHashMap<String, PendingClientHandshake>()
     private val handshakeWaiters = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
+    val localRoutingNodeId: RoutingNodeId = RoutingNodeId.deriveFromDeviceIdentity(
+        deviceId = identityManager.deviceId,
+        publicKeyBytes = identityManager.getPublicKeyBytes()
+    )
+
+    val routingTable: KademliaRoutingTable = KademliaRoutingTable(
+        localNodeId = localRoutingNodeId,
+        config = KademliaConfig(),
+        clock = clock
+    )
+
+    val kademliaNextHopResolver: KademliaNextHopResolver = KademliaNextHopResolver(
+        routingTable = routingTable,
+        fallbackDirectAddressLookup = { destDeviceId ->
+            deviceIdToAddress[destDeviceId]
+        }
+    )
+
     val forwardingEngine: ForwardingEngine = ForwardingEngine(
         localDeviceId = identityManager.deviceId,
         duplicateCache = duplicateCache ?: InMemoryDuplicateMessageCache(clock = clock),
-        nextHopResolver = nextHopResolver ?: DirectPeerNextHopResolver { destDeviceId ->
-            deviceIdToAddress[destDeviceId]
-        },
+        nextHopResolver = nextHopResolver ?: kademliaNextHopResolver,
         clock = clock
     )
 
@@ -466,6 +487,7 @@ class OmniMeshP2pEngine(
                     val devId = addressToDeviceId[addr]
                     if (devId != null) {
                         sessionsByDeviceId.remove(devId)
+                        routingTable.markDeviceDisconnected(devId)
                     }
                     sessionStatesByAddress[addr] =
                         if (event.status == PeerConnectionStatus.FAILED) SessionState.FAILED else SessionState.CLOSED
@@ -606,6 +628,25 @@ class OmniMeshP2pEngine(
                 bleAddress = peerAddress,
                 lastSeenAt = clock(),
                 lastRssi = existingDiscovered?.rssi ?: -60
+            )
+        )
+        routingTable.upsertNode(
+            RoutingNodeEntry(
+                nodeId = RoutingNodeId.deriveFromDeviceIdentity(
+                    deviceId = session.peerDeviceId,
+                    publicKeyBytes = session.peerIdentityPubKey,
+                    idBitLength = routingTable.config.idBitLength
+                ),
+                deviceId = session.peerDeviceId,
+                identityFingerprint = session.peerFingerprint,
+                identityPublicKey = session.peerIdentityPubKey,
+                lastSeenAt = clock(),
+                transportCapabilities = setOf(primaryTransport.type),
+                reachableTransports = setOf(primaryTransport.type),
+                endpointAddress = peerAddress,
+                isDirectlyReachable = true,
+                consecutiveFailures = 0,
+                trustState = RoutingTrustState.VERIFIED_IDENTITY
             )
         )
     }
