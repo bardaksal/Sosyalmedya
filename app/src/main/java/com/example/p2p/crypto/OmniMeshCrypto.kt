@@ -1,8 +1,11 @@
 package com.example.p2p.crypto
 
 import com.example.p2p.identity.DeviceIdentityManager
+import kotlinx.coroutines.CancellationException
+import java.nio.BufferUnderflowException
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.security.GeneralSecurityException
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -129,7 +132,11 @@ data class HandshakeInitPacket(
                     clientNonce = nonce,
                     signature = sig
                 )
-            } catch (_: Exception) {
+            } catch (_: BufferUnderflowException) {
+                null
+            } catch (_: IndexOutOfBoundsException) {
+                null
+            } catch (_: IllegalArgumentException) {
                 null
             }
         }
@@ -207,7 +214,11 @@ data class HandshakeAckPacket(
                     serverNonce = nonce,
                     signature = sig
                 )
-            } catch (_: Exception) {
+            } catch (_: BufferUnderflowException) {
+                null
+            } catch (_: IndexOutOfBoundsException) {
+                null
+            } catch (_: IllegalArgumentException) {
                 null
             }
         }
@@ -268,10 +279,15 @@ data class PendingClientHandshake(
  */
 class OmniMeshCrypto(
     private val identityManager: DeviceIdentityManager,
-    private val clock: () -> Long = { System.currentTimeMillis() }
+    private val clock: () -> Long = { System.currentTimeMillis() },
+    private val maxE2eNonceCacheSize: Int = DEFAULT_MAX_E2E_NONCE_CACHE_SIZE
 ) {
+    init {
+        require(maxE2eNonceCacheSize > 0) { "maxE2eNonceCacheSize must be positive" }
+    }
+
     private val secureRandom = SecureRandom()
-    private val seenE2eNonces = HashSet<String>()
+    private val seenE2eNonces = LinkedHashMap<String, Long>()
 
     fun createHandshakeInit(): PendingClientHandshake {
         val ephPair = generateEphemeralEcPair()
@@ -524,7 +540,11 @@ class OmniMeshCrypto(
             cipher.init(Cipher.DECRYPT_MODE, session.rxKey, GCMParameterSpec(128, envelope.nonce))
             cipher.updateAAD(envelope.buildAdditionalAuthenticatedData())
             cipher.doFinal(combined)
-        } catch (_: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: GeneralSecurityException) {
+            return EnvelopeVerificationResult.InvalidMessage("Integrity or decryption verification failed")
+        } catch (_: IllegalArgumentException) {
             return EnvelopeVerificationResult.InvalidMessage("Integrity or decryption verification failed")
         }
 
@@ -676,10 +696,8 @@ class OmniMeshCrypto(
 
         val nonceHex = envelope.nonce.joinToString("") { "%02x".format(it) }
         val scopedNonceKey = "${envelope.senderDeviceId}:$nonceHex"
-        synchronized(seenE2eNonces) {
-            if (seenE2eNonces.contains(scopedNonceKey)) {
-                return EnvelopeVerificationResult.ReplayDetected(envelope.messageId)
-            }
+        if (checkAndPruneE2eNonce(scopedNonceKey, now)) {
+            return EnvelopeVerificationResult.ReplayDetected(envelope.messageId)
         }
         if (replayStore.isMessageSeen(envelope.messageId)) {
             return EnvelopeVerificationResult.ReplayDetected(envelope.messageId)
@@ -716,7 +734,11 @@ class OmniMeshCrypto(
             cipher.init(Cipher.DECRYPT_MODE, e2eKey, GCMParameterSpec(128, envelope.nonce))
             cipher.updateAAD(envelope.buildAdditionalAuthenticatedData())
             cipher.doFinal(combined)
-        } catch (_: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: GeneralSecurityException) {
+            return EnvelopeVerificationResult.InvalidMessage("End-to-end integrity or decryption verification failed")
+        } catch (_: IllegalArgumentException) {
             return EnvelopeVerificationResult.InvalidMessage("End-to-end integrity or decryption verification failed")
         } finally {
             dhEphemeral?.let { java.util.Arrays.fill(it, 0.toByte()) }
@@ -724,9 +746,7 @@ class OmniMeshCrypto(
             e2eKeyBytes?.let { java.util.Arrays.fill(it, 0.toByte()) }
         }
 
-        synchronized(seenE2eNonces) {
-            seenE2eNonces.add(scopedNonceKey)
-        }
+        recordE2eNonce(scopedNonceKey, now)
         replayStore.recordMessageSeen(
             messageId = envelope.messageId,
             senderDeviceId = envelope.senderDeviceId,
@@ -738,6 +758,38 @@ class OmniMeshCrypto(
         return EnvelopeVerificationResult.Valid(plaintext, envelope)
     }
 
+    private fun checkAndPruneE2eNonce(scopedNonceKey: String, now: Long): Boolean {
+        synchronized(seenE2eNonces) {
+            pruneExpiredE2eNoncesLocked(now)
+            val expiresAt = seenE2eNonces[scopedNonceKey] ?: return false
+            return expiresAt > now
+        }
+    }
+
+    private fun recordE2eNonce(scopedNonceKey: String, now: Long) {
+        synchronized(seenE2eNonces) {
+            pruneExpiredE2eNoncesLocked(now)
+            while (seenE2eNonces.size >= maxE2eNonceCacheSize) {
+                val eldest = seenE2eNonces.entries.iterator()
+                if (!eldest.hasNext()) break
+                eldest.next()
+                eldest.remove()
+            }
+            seenE2eNonces[scopedNonceKey] = now + REPLAY_RETENTION_MS
+        }
+    }
+
+    private fun pruneExpiredE2eNoncesLocked(now: Long) {
+        val iterator = seenE2eNonces.entries.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next().value <= now) {
+                iterator.remove()
+            }
+        }
+    }
+
+    internal fun e2eNonceCacheSize(): Int = synchronized(seenE2eNonces) { seenE2eNonces.size }
+
     private fun generateEphemeralEcPair(): KeyPair {
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(ECGenParameterSpec("secp256r1"), secureRandom)
@@ -747,7 +799,9 @@ class OmniMeshCrypto(
     private fun decodeEcPublicKey(encoded: ByteArray): PublicKey? {
         return try {
             KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(encoded))
-        } catch (_: Exception) {
+        } catch (_: GeneralSecurityException) {
+            null
+        } catch (_: IllegalArgumentException) {
             null
         }
     }
@@ -763,14 +817,18 @@ class OmniMeshCrypto(
         responderEphPub: ByteArray,
         isInitiator: Boolean
     ): Pair<SecretKey, SecretKey>? {
+        var sharedSecret: ByteArray? = null
+        var prk: ByteArray? = null
+        var initiatorToResponder: ByteArray? = null
+        var responderToInitiator: ByteArray? = null
         return try {
             val ka = KeyAgreement.getInstance("ECDH")
             ka.init(localEphemeralPrivate)
             ka.doPhase(peerEphemeralPublic, true)
-            val sharedSecret = ka.generateSecret()
+            sharedSecret = ka.generateSecret()
 
             val salt = clientNonce + serverNonce
-            val prk = hmacSha256(salt, sharedSecret)
+            prk = hmacSha256(salt, sharedSecret)
             val transcriptHash = java.security.MessageDigest.getInstance("SHA-256").apply {
                 update(initiatorDeviceId.toByteArray(StandardCharsets.UTF_8))
                 update(responderDeviceId.toByteArray(StandardCharsets.UTF_8))
@@ -778,12 +836,12 @@ class OmniMeshCrypto(
                 update(responderEphPub)
             }.digest()
 
-            val initiatorToResponder = hkdfExpandSha256(
+            initiatorToResponder = hkdfExpandSha256(
                 prk,
                 "OMNIMESH_I2R_V1".toByteArray(StandardCharsets.UTF_8) + transcriptHash,
                 32
             )
-            val responderToInitiator = hkdfExpandSha256(
+            responderToInitiator = hkdfExpandSha256(
                 prk,
                 "OMNIMESH_R2I_V1".toByteArray(StandardCharsets.UTF_8) + transcriptHash,
                 32
@@ -791,11 +849,16 @@ class OmniMeshCrypto(
 
             val i2rKey = SecretKeySpec(initiatorToResponder, "AES")
             val r2iKey = SecretKeySpec(responderToInitiator, "AES")
-            java.util.Arrays.fill(sharedSecret, 0.toByte())
-            java.util.Arrays.fill(prk, 0.toByte())
             if (isInitiator) i2rKey to r2iKey else r2iKey to i2rKey
-        } catch (_: Exception) {
+        } catch (_: GeneralSecurityException) {
             null
+        } catch (_: IllegalArgumentException) {
+            null
+        } finally {
+            sharedSecret?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            prk?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            initiatorToResponder?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            responderToInitiator?.let { java.util.Arrays.fill(it, 0.toByte()) }
         }
     }
 
@@ -855,21 +918,30 @@ class OmniMeshCrypto(
     private fun hkdfExpandSha256(prk: ByteArray, info: ByteArray, length: Int): ByteArray {
         val okm = ByteArray(length)
         var offset = 0
-        var t = ByteArray(0)
+        var currentT = ByteArray(0)
         var counter = 1
-        while (offset < length) {
-            val mac = Mac.getInstance("HmacSHA256")
-            mac.init(SecretKeySpec(prk, "HmacSHA256"))
-            mac.update(t)
-            mac.update(info)
-            mac.update(counter.toByte())
-            t = mac.doFinal()
-            val copyLen = minOf(t.size, length - offset)
-            System.arraycopy(t, 0, okm, offset, copyLen)
-            offset += copyLen
-            counter++
+        return try {
+            while (offset < length) {
+                val mac = Mac.getInstance("HmacSHA256")
+                mac.init(SecretKeySpec(prk, "HmacSHA256"))
+                mac.update(currentT)
+                mac.update(info)
+                mac.update(counter.toByte())
+                val nextT = mac.doFinal()
+                java.util.Arrays.fill(currentT, 0.toByte())
+                currentT = nextT
+                val copyLen = minOf(currentT.size, length - offset)
+                System.arraycopy(currentT, 0, okm, offset, copyLen)
+                offset += copyLen
+                counter++
+            }
+            okm
+        } catch (t: Throwable) {
+            java.util.Arrays.fill(okm, 0.toByte())
+            throw t
+        } finally {
+            java.util.Arrays.fill(currentT, 0.toByte())
         }
-        return okm
     }
 
     private fun buildInitTranscript(
@@ -907,5 +979,6 @@ class OmniMeshCrypto(
         const val MAX_MESSAGE_AGE_MS = 5 * 60 * 1000L
         const val MAX_FUTURE_CLOCK_SKEW_MS = 60 * 1000L
         const val REPLAY_RETENTION_MS = 24 * 60 * 60 * 1000L
+        const val DEFAULT_MAX_E2E_NONCE_CACHE_SIZE = 4_096
     }
 }

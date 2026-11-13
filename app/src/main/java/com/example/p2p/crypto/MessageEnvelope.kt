@@ -1,6 +1,9 @@
 package com.example.p2p.crypto
 
+import java.nio.BufferUnderflowException
 import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
@@ -257,10 +260,16 @@ data class MessageEnvelope(
                 }
                 val ciphertext = ByteArray(cipherLen)
                 buffer.get(ciphertext)
+                val messageId = decodeStrictUtf8(msgIdBytes) ?: return null
+                val senderDeviceId = decodeStrictUtf8(senderBytes) ?: return null
+                val destinationDeviceId = decodeStrictUtf8(destBytes) ?: return null
+                if (messageId.isBlank() || senderDeviceId.isBlank() || destinationDeviceId.isBlank()) {
+                    return null
+                }
                 create(
-                    messageId = String(msgIdBytes, StandardCharsets.UTF_8),
-                    senderDeviceId = String(senderBytes, StandardCharsets.UTF_8),
-                    destinationDeviceId = String(destBytes, StandardCharsets.UTF_8),
+                    messageId = messageId,
+                    senderDeviceId = senderDeviceId,
+                    destinationDeviceId = destinationDeviceId,
                     createdAt = createdAt,
                     protocolVersion = version,
                     ttl = ttl,
@@ -271,7 +280,24 @@ data class MessageEnvelope(
                     ciphertext = ciphertext,
                     authenticationTag = tag
                 )
-            } catch (_: Exception) {
+            } catch (_: BufferUnderflowException) {
+                null
+            } catch (_: IndexOutOfBoundsException) {
+                null
+            } catch (_: IllegalArgumentException) {
+                null
+            } catch (_: CharacterCodingException) {
+                null
+            }
+        }
+
+        private fun decodeStrictUtf8(bytes: ByteArray): String? {
+            return try {
+                val decoder = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                decoder.decode(ByteBuffer.wrap(bytes)).toString()
+            } catch (_: CharacterCodingException) {
                 null
             }
         }
