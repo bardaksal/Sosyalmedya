@@ -83,12 +83,14 @@ class OmniMeshProtocolAndSecurityTest {
 
     @Test
     fun envelopeSerialization_roundtripsAndRejectsCorruptBytes() {
-        val env = MessageEnvelope(
+        val env = MessageEnvelope.create(
             messageId = MessageEnvelope.newMessageId(),
             senderDeviceId = "omn-sender-1",
-            receiverDeviceId = "omn-receiver-2",
-            timestamp = 1_700_000_000_000L,
+            destinationDeviceId = "omn-receiver-2",
+            createdAt = 1_700_000_000_000L,
             protocolVersion = MessageEnvelope.CURRENT_PROTOCOL_VERSION,
+            ttl = 5,
+            hopCount = 0,
             nonce = ByteArray(12) { it.toByte() },
             ciphertext = "encrypted-payload".toByteArray(StandardCharsets.UTF_8),
             authenticationTag = ByteArray(16) { (it + 10).toByte() }
@@ -151,7 +153,7 @@ class OmniMeshProtocolAndSecurityTest {
         val badCipher = freshEnv.ciphertext.copyOf().apply { this[0] = (this[0].toInt() xor 0xFF).toByte() }
         val tamperedCipherRes = cryptoB.decryptAndVerifyEnvelope(
             sessionB2,
-            freshEnv.copy(ciphertext = badCipher),
+            freshEnv.copy(encryptedPayload = freshEnv.encryptedPayload.copy(ciphertext = badCipher)),
             InMemoryReplayStore()
         )
         assertTrue(tamperedCipherRes is EnvelopeVerificationResult.InvalidMessage)
@@ -160,7 +162,7 @@ class OmniMeshProtocolAndSecurityTest {
         val badTag = freshEnv.authenticationTag.copyOf().apply { this[0] = (this[0].toInt() xor 0x01).toByte() }
         val tamperedTagRes = cryptoB.decryptAndVerifyEnvelope(
             sessionB2,
-            freshEnv.copy(authenticationTag = badTag),
+            freshEnv.copy(encryptedPayload = freshEnv.encryptedPayload.copy(authenticationTag = badTag)),
             InMemoryReplayStore()
         )
         assertTrue(tamperedTagRes is EnvelopeVerificationResult.InvalidMessage)
@@ -169,15 +171,15 @@ class OmniMeshProtocolAndSecurityTest {
         val badNonce = freshEnv.nonce.copyOf().apply { this[0] = (this[0].toInt() xor 0x55).toByte() }
         val tamperedNonceRes = cryptoB.decryptAndVerifyEnvelope(
             sessionB2,
-            freshEnv.copy(nonce = badNonce),
+            freshEnv.copy(encryptedPayload = freshEnv.encryptedPayload.copy(nonce = badNonce)),
             InMemoryReplayStore()
         )
         assertTrue(tamperedNonceRes is EnvelopeVerificationResult.InvalidMessage)
 
-        // 7. Wrong receiverDeviceId rejected
+        // 7. Wrong destinationDeviceId rejected
         val wrongReceiverRes = cryptoB.decryptAndVerifyEnvelope(
             sessionB2,
-            freshEnv.copy(receiverDeviceId = "omn-wrong-device"),
+            freshEnv.copy(routingMetadata = freshEnv.routingMetadata.copy(destinationDeviceId = "omn-wrong-device")),
             InMemoryReplayStore()
         )
         assertTrue(wrongReceiverRes is EnvelopeVerificationResult.InvalidMessage)
@@ -185,7 +187,7 @@ class OmniMeshProtocolAndSecurityTest {
         // 8. Unsupported protocol version rejected
         val wrongVersionRes = cryptoB.decryptAndVerifyEnvelope(
             sessionB2,
-            freshEnv.copy(protocolVersion = 99),
+            freshEnv.copy(routingMetadata = freshEnv.routingMetadata.copy(protocolVersion = 99)),
             InMemoryReplayStore()
         )
         assertTrue(wrongVersionRes is EnvelopeVerificationResult.InvalidMessage)
@@ -194,7 +196,7 @@ class OmniMeshProtocolAndSecurityTest {
         val expiredEnv = cryptoA.encryptEnvelope(
             sessionA2,
             plaintext.toByteArray(StandardCharsets.UTF_8),
-            timestamp = currentTimeMs - OmniMeshCrypto.MAX_MESSAGE_AGE_MS - 1_000L
+            createdAt = currentTimeMs - OmniMeshCrypto.MAX_MESSAGE_AGE_MS - 1_000L
         )
         val expiredRes = cryptoB.decryptAndVerifyEnvelope(sessionB2, expiredEnv, InMemoryReplayStore())
         assertTrue(expiredRes is EnvelopeVerificationResult.Expired)

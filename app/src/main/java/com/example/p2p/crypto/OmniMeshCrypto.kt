@@ -434,15 +434,19 @@ class OmniMeshCrypto(
         session: SecureSession,
         plaintext: ByteArray,
         messageId: String = MessageEnvelope.newMessageId(),
-        timestamp: Long = clock()
+        createdAt: Long = clock(),
+        ttl: Int = MessageEnvelope.DEFAULT_TTL
     ): MessageEnvelope {
+        require(ttl in 0..MessageEnvelope.MAX_TTL) { "Invalid TTL: $ttl" }
         val nonce = ByteArray(MessageEnvelope.NONCE_SIZE_BYTES).also { secureRandom.nextBytes(it) }
-        val draft = MessageEnvelope(
+        val draft = MessageEnvelope.create(
             messageId = messageId,
             senderDeviceId = identityManager.deviceId,
-            receiverDeviceId = session.peerDeviceId,
-            timestamp = timestamp,
+            destinationDeviceId = session.peerDeviceId,
+            createdAt = createdAt,
             protocolVersion = MessageEnvelope.CURRENT_PROTOCOL_VERSION,
+            ttl = ttl,
+            hopCount = 0,
             nonce = nonce,
             ciphertext = ByteArray(0),
             authenticationTag = ByteArray(MessageEnvelope.AUTH_TAG_SIZE_BYTES)
@@ -456,7 +460,12 @@ class OmniMeshCrypto(
         val splitIndex = combined.size - MessageEnvelope.AUTH_TAG_SIZE_BYTES
         val ciphertext = combined.copyOfRange(0, splitIndex)
         val tag = combined.copyOfRange(splitIndex, combined.size)
-        return draft.copy(ciphertext = ciphertext, authenticationTag = tag)
+        return draft.copy(
+            encryptedPayload = draft.encryptedPayload.copy(
+                ciphertext = ciphertext,
+                authenticationTag = tag
+            )
+        )
     }
 
     suspend fun decryptAndVerifyEnvelope(
@@ -467,11 +476,16 @@ class OmniMeshCrypto(
         if (envelope.protocolVersion != MessageEnvelope.CURRENT_PROTOCOL_VERSION) {
             return EnvelopeVerificationResult.InvalidMessage("Unsupported protocol version")
         }
-        if (envelope.receiverDeviceId != identityManager.deviceId) {
-            return EnvelopeVerificationResult.InvalidMessage("Receiver device mismatch")
+        if (envelope.destinationDeviceId != identityManager.deviceId) {
+            return EnvelopeVerificationResult.InvalidMessage("Destination device mismatch")
         }
         if (envelope.senderDeviceId != session.peerDeviceId) {
             return EnvelopeVerificationResult.InvalidMessage("Sender device mismatch")
+        }
+        if (envelope.ttl < 0 || envelope.ttl > MessageEnvelope.MAX_TTL ||
+            envelope.hopCount < 0 || envelope.hopCount > MessageEnvelope.MAX_HOP_COUNT
+        ) {
+            return EnvelopeVerificationResult.InvalidMessage("Invalid routing TTL or hopCount")
         }
         if (envelope.nonce.size != MessageEnvelope.NONCE_SIZE_BYTES ||
             envelope.authenticationTag.size != MessageEnvelope.AUTH_TAG_SIZE_BYTES
@@ -480,10 +494,10 @@ class OmniMeshCrypto(
         }
 
         val now = clock()
-        if (envelope.timestamp < now - MAX_MESSAGE_AGE_MS) {
+        if (envelope.createdAt < now - MAX_MESSAGE_AGE_MS) {
             return EnvelopeVerificationResult.Expired(envelope.messageId)
         }
-        if (envelope.timestamp > now + MAX_FUTURE_CLOCK_SKEW_MS) {
+        if (envelope.createdAt > now + MAX_FUTURE_CLOCK_SKEW_MS) {
             return EnvelopeVerificationResult.InvalidMessage("Timestamp skew out of bounds")
         }
 
