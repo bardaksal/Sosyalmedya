@@ -271,6 +271,7 @@ class OmniMeshCrypto(
     private val clock: () -> Long = { System.currentTimeMillis() }
 ) {
     private val secureRandom = SecureRandom()
+    private val seenE2eNonces = HashSet<String>()
 
     fun createHandshakeInit(): PendingClientHandshake {
         val ephPair = generateEphemeralEcPair()
@@ -473,6 +474,9 @@ class OmniMeshCrypto(
         envelope: MessageEnvelope,
         replayStore: ReplayStore
     ): EnvelopeVerificationResult {
+        if (envelope.encryptionMode != PayloadEncryptionMode.TRANSPORT_SESSION) {
+            return EnvelopeVerificationResult.InvalidMessage("Expected transport-session payload mode")
+        }
         if (envelope.protocolVersion != MessageEnvelope.CURRENT_PROTOCOL_VERSION) {
             return EnvelopeVerificationResult.InvalidMessage("Unsupported protocol version")
         }
@@ -539,6 +543,201 @@ class OmniMeshCrypto(
         return EnvelopeVerificationResult.Valid(plaintext, envelope)
     }
 
+    /**
+     * Encrypts [plaintext] End-to-End for [destinationDeviceId] using:
+     * - Ephemeral P-256 ECDH ([ephPriv] x [destinationIdentityPubKey]) for per-message key isolation
+     * - Identity P-256 ECDH ([localIdentityPriv] x [destinationIdentityPubKey]) for sender authentication
+     * - HKDF-SHA256 with length-prefixed binding metadata
+     * - AES-256-GCM with full immutable envelope AAD
+     *
+     * Relay nodes forwarding this envelope cannot derive the E2E key or read [plaintext].
+     */
+    fun encryptEndToEndEnvelope(
+        destinationDeviceId: String,
+        destinationIdentityPubKey: ByteArray,
+        plaintext: ByteArray,
+        messageId: String = MessageEnvelope.newMessageId(),
+        createdAt: Long = clock(),
+        ttl: Int = MessageEnvelope.DEFAULT_TTL
+    ): MessageEnvelope {
+        require(destinationDeviceId.isNotBlank()) { "Destination deviceId must not be blank" }
+        require(destinationDeviceId != identityManager.deviceId) { "Cannot E2E-encrypt to self" }
+        require(ttl in 0..MessageEnvelope.MAX_TTL) { "Invalid TTL: $ttl" }
+        val destinationEcPub = requireNotNull(decodeEcPublicKey(destinationIdentityPubKey)) {
+            "Invalid destination EC public key"
+        }
+
+        val ephPair = generateEphemeralEcPair()
+        val ephPubBytes = ephPair.public.encoded
+        val nonce = ByteArray(MessageEnvelope.NONCE_SIZE_BYTES).also { secureRandom.nextBytes(it) }
+        val draft = MessageEnvelope.create(
+            messageId = messageId,
+            senderDeviceId = identityManager.deviceId,
+            destinationDeviceId = destinationDeviceId,
+            createdAt = createdAt,
+            protocolVersion = MessageEnvelope.CURRENT_PROTOCOL_VERSION,
+            ttl = ttl,
+            hopCount = 0,
+            encryptionMode = PayloadEncryptionMode.END_TO_END,
+            senderEphemeralPubKey = ephPubBytes,
+            nonce = nonce,
+            ciphertext = ByteArray(0),
+            authenticationTag = ByteArray(MessageEnvelope.AUTH_TAG_SIZE_BYTES)
+        )
+
+        var dhEphemeral: ByteArray? = null
+        var dhStatic: ByteArray? = null
+        var e2eKeyBytes: ByteArray? = null
+        try {
+            val ka = KeyAgreement.getInstance("ECDH")
+            ka.init(ephPair.private)
+            ka.doPhase(destinationEcPub, true)
+            dhEphemeral = ka.generateSecret()
+
+            dhStatic = requireNotNull(identityManager.performIdentityEcdh(destinationIdentityPubKey)) {
+                "Identity ECDH failed for destination key"
+            }
+
+            e2eKeyBytes = deriveEndToEndMessageKey(
+                dhEphemeral = dhEphemeral,
+                dhStatic = dhStatic,
+                nonce = nonce,
+                envelope = draft
+            )
+            val e2eKey = SecretKeySpec(e2eKeyBytes, "AES")
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, e2eKey, GCMParameterSpec(128, nonce))
+            cipher.updateAAD(draft.buildAdditionalAuthenticatedData())
+            val combined = cipher.doFinal(plaintext)
+
+            val splitIndex = combined.size - MessageEnvelope.AUTH_TAG_SIZE_BYTES
+            val ciphertext = combined.copyOfRange(0, splitIndex)
+            val tag = combined.copyOfRange(splitIndex, combined.size)
+            return draft.copy(
+                encryptedPayload = draft.encryptedPayload.copy(
+                    ciphertext = ciphertext,
+                    authenticationTag = tag
+                )
+            )
+        } finally {
+            dhEphemeral?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            dhStatic?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            e2eKeyBytes?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            runCatching { ephPair.private.destroy() }
+        }
+    }
+
+    /**
+     * Verifies and decrypts a [PayloadEncryptionMode.END_TO_END] envelope at the final destination,
+     * binding against [trustedSenderIdentityPubKey] (pinned/known sender identity) and [replayStore].
+     */
+    suspend fun decryptAndVerifyE2eEnvelope(
+        envelope: MessageEnvelope,
+        trustedSenderIdentityPubKey: ByteArray?,
+        replayStore: ReplayStore
+    ): EnvelopeVerificationResult {
+        if (envelope.encryptionMode != PayloadEncryptionMode.END_TO_END) {
+            return EnvelopeVerificationResult.InvalidMessage("Expected end-to-end payload mode")
+        }
+        if (envelope.protocolVersion != MessageEnvelope.CURRENT_PROTOCOL_VERSION) {
+            return EnvelopeVerificationResult.InvalidMessage("Unsupported protocol version")
+        }
+        if (envelope.destinationDeviceId != identityManager.deviceId) {
+            return EnvelopeVerificationResult.InvalidMessage("Destination device mismatch")
+        }
+        if (envelope.senderDeviceId.isBlank() || envelope.senderDeviceId == identityManager.deviceId) {
+            return EnvelopeVerificationResult.InvalidMessage("Invalid sender deviceId")
+        }
+        if (trustedSenderIdentityPubKey == null ||
+            trustedSenderIdentityPubKey.size !in MessageEnvelope.MIN_EPHEMERAL_PUB_KEY_BYTES..MessageEnvelope.MAX_EPHEMERAL_PUB_KEY_BYTES
+        ) {
+            return EnvelopeVerificationResult.InvalidMessage("Missing or untrusted sender identity public key")
+        }
+        if (envelope.ttl < 0 || envelope.ttl > MessageEnvelope.MAX_TTL ||
+            envelope.hopCount < 0 || envelope.hopCount > MessageEnvelope.MAX_HOP_COUNT
+        ) {
+            return EnvelopeVerificationResult.InvalidMessage("Invalid routing TTL or hopCount")
+        }
+        if (envelope.nonce.size != MessageEnvelope.NONCE_SIZE_BYTES ||
+            envelope.authenticationTag.size != MessageEnvelope.AUTH_TAG_SIZE_BYTES ||
+            envelope.senderEphemeralPubKey.size !in
+            MessageEnvelope.MIN_EPHEMERAL_PUB_KEY_BYTES..MessageEnvelope.MAX_EPHEMERAL_PUB_KEY_BYTES
+        ) {
+            return EnvelopeVerificationResult.InvalidMessage("Invalid E2E cryptographic parameters")
+        }
+
+        val now = clock()
+        if (envelope.createdAt < now - MAX_MESSAGE_AGE_MS) {
+            return EnvelopeVerificationResult.Expired(envelope.messageId)
+        }
+        if (envelope.createdAt > now + MAX_FUTURE_CLOCK_SKEW_MS) {
+            return EnvelopeVerificationResult.InvalidMessage("Timestamp skew out of bounds")
+        }
+
+        val nonceHex = envelope.nonce.joinToString("") { "%02x".format(it) }
+        val scopedNonceKey = "${envelope.senderDeviceId}:$nonceHex"
+        synchronized(seenE2eNonces) {
+            if (seenE2eNonces.contains(scopedNonceKey)) {
+                return EnvelopeVerificationResult.ReplayDetected(envelope.messageId)
+            }
+        }
+        if (replayStore.isMessageSeen(envelope.messageId)) {
+            return EnvelopeVerificationResult.ReplayDetected(envelope.messageId)
+        }
+
+        var dhEphemeral: ByteArray? = null
+        var dhStatic: ByteArray? = null
+        var e2eKeyBytes: ByteArray? = null
+        val plaintext = try {
+            dhEphemeral = identityManager.performIdentityEcdh(envelope.senderEphemeralPubKey)
+                ?: return EnvelopeVerificationResult.InvalidMessage("Invalid E2E ephemeral sender key")
+            dhStatic = identityManager.performIdentityEcdh(trustedSenderIdentityPubKey)
+                ?: return EnvelopeVerificationResult.InvalidMessage("Invalid trusted sender identity key")
+
+            e2eKeyBytes = deriveEndToEndMessageKey(
+                dhEphemeral = dhEphemeral,
+                dhStatic = dhStatic,
+                nonce = envelope.nonce,
+                envelope = envelope
+            )
+            val e2eKey = SecretKeySpec(e2eKeyBytes, "AES")
+
+            val combined = ByteArray(envelope.ciphertext.size + envelope.authenticationTag.size)
+            System.arraycopy(envelope.ciphertext, 0, combined, 0, envelope.ciphertext.size)
+            System.arraycopy(
+                envelope.authenticationTag,
+                0,
+                combined,
+                envelope.ciphertext.size,
+                envelope.authenticationTag.size
+            )
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, e2eKey, GCMParameterSpec(128, envelope.nonce))
+            cipher.updateAAD(envelope.buildAdditionalAuthenticatedData())
+            cipher.doFinal(combined)
+        } catch (_: Exception) {
+            return EnvelopeVerificationResult.InvalidMessage("End-to-end integrity or decryption verification failed")
+        } finally {
+            dhEphemeral?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            dhStatic?.let { java.util.Arrays.fill(it, 0.toByte()) }
+            e2eKeyBytes?.let { java.util.Arrays.fill(it, 0.toByte()) }
+        }
+
+        synchronized(seenE2eNonces) {
+            seenE2eNonces.add(scopedNonceKey)
+        }
+        replayStore.recordMessageSeen(
+            messageId = envelope.messageId,
+            senderDeviceId = envelope.senderDeviceId,
+            nonceHex = nonceHex,
+            seenAt = now,
+            expiresAt = now + REPLAY_RETENTION_MS
+        )
+
+        return EnvelopeVerificationResult.Valid(plaintext, envelope)
+    }
+
     private fun generateEphemeralEcPair(): KeyPair {
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(ECGenParameterSpec("secp256r1"), secureRandom)
@@ -592,10 +791,59 @@ class OmniMeshCrypto(
 
             val i2rKey = SecretKeySpec(initiatorToResponder, "AES")
             val r2iKey = SecretKeySpec(responderToInitiator, "AES")
+            java.util.Arrays.fill(sharedSecret, 0.toByte())
+            java.util.Arrays.fill(prk, 0.toByte())
             if (isInitiator) i2rKey to r2iKey else r2iKey to i2rKey
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun deriveEndToEndMessageKey(
+        dhEphemeral: ByteArray,
+        dhStatic: ByteArray,
+        nonce: ByteArray,
+        envelope: MessageEnvelope
+    ): ByteArray {
+        val ikm = ByteArray(dhEphemeral.size + dhStatic.size)
+        var prk: ByteArray? = null
+        return try {
+            System.arraycopy(dhEphemeral, 0, ikm, 0, dhEphemeral.size)
+            System.arraycopy(dhStatic, 0, ikm, dhEphemeral.size, dhStatic.size)
+            prk = hmacSha256(nonce, ikm)
+            val info = buildE2eKdfInfo(envelope)
+            hkdfExpandSha256(prk, info, 32)
+        } finally {
+            java.util.Arrays.fill(ikm, 0.toByte())
+            prk?.let { java.util.Arrays.fill(it, 0.toByte()) }
+        }
+    }
+
+    private fun buildE2eKdfInfo(envelope: MessageEnvelope): ByteArray {
+        val label = "OMNIMESH_E2E_MSG_V1".toByteArray(StandardCharsets.UTF_8)
+        val msgIdBytes = envelope.messageId.toByteArray(StandardCharsets.UTF_8)
+        val senderBytes = envelope.senderDeviceId.toByteArray(StandardCharsets.UTF_8)
+        val destBytes = envelope.destinationDeviceId.toByteArray(StandardCharsets.UTF_8)
+        val ephPubBytes = envelope.senderEphemeralPubKey
+        val total = (4 + label.size) + 4 + 8 +
+            (4 + msgIdBytes.size) +
+            (4 + senderBytes.size) +
+            (4 + destBytes.size) +
+            (4 + ephPubBytes.size)
+        val buf = ByteBuffer.allocate(total)
+        putIntPrefixed(buf, label)
+        buf.putInt(envelope.protocolVersion)
+        buf.putLong(envelope.createdAt)
+        putIntPrefixed(buf, msgIdBytes)
+        putIntPrefixed(buf, senderBytes)
+        putIntPrefixed(buf, destBytes)
+        putIntPrefixed(buf, ephPubBytes)
+        return buf.array()
+    }
+
+    private fun putIntPrefixed(buf: ByteBuffer, data: ByteArray) {
+        buf.putInt(data.size)
+        buf.put(data)
     }
 
     private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {

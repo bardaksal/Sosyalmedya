@@ -2,6 +2,7 @@ package com.example.p2p.forwarding
 
 import com.example.p2p.crypto.MessageEnvelope
 import com.example.p2p.crypto.OmniMeshCrypto
+import com.example.p2p.crypto.PayloadEncryptionMode
 import com.example.p2p.routing.NextHopResolution
 import com.example.p2p.routing.NextHopResolver
 import com.example.p2p.routing.NoOpPendingForwardSink
@@ -132,6 +133,26 @@ class ForwardingEngine(
                 DropReason.INVALID_MESSAGE,
                 "Invalid cryptographic nonce or authentication tag length"
             )
+        }
+        when (envelope.encryptionMode) {
+            PayloadEncryptionMode.TRANSPORT_SESSION -> {
+                if (envelope.senderEphemeralPubKey.isNotEmpty()) {
+                    return ForwardingDecision.Drop(
+                        DropReason.INVALID_MESSAGE,
+                        "Transport-session packet must not carry E2E ephemeral key"
+                    )
+                }
+            }
+            PayloadEncryptionMode.END_TO_END -> {
+                if (envelope.senderEphemeralPubKey.size !in
+                    MessageEnvelope.MIN_EPHEMERAL_PUB_KEY_BYTES..MessageEnvelope.MAX_EPHEMERAL_PUB_KEY_BYTES
+                ) {
+                    return ForwardingDecision.Drop(
+                        DropReason.INVALID_MESSAGE,
+                        "Missing or invalid E2E sender ephemeral key"
+                    )
+                }
+            }
         }
 
         val now = clock()

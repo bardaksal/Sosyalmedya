@@ -28,9 +28,26 @@ data class RoutingMetadata(
 }
 
 /**
- * End-to-end AES-256-GCM encrypted payload bytes and authentication primitives.
+ * Distinguishes hop-by-hop link encryption ([TRANSPORT_SESSION]) from multi-hop
+ * end-to-end encryption ([END_TO_END]) readable only by [RoutingMetadata.destinationDeviceId].
+ */
+enum class PayloadEncryptionMode(val code: Byte) {
+    TRANSPORT_SESSION(1),
+    END_TO_END(2);
+
+    companion object {
+        fun fromCode(code: Byte): PayloadEncryptionMode? = entries.firstOrNull { it.code == code }
+    }
+}
+
+/**
+ * AES-256-GCM encrypted payload bytes and authentication primitives.
+ * For [PayloadEncryptionMode.END_TO_END], [senderEphemeralPubKey] carries the sender's
+ * per-message X.509 P-256 ephemeral public key needed by the destination to derive the E2E key.
  */
 data class EncryptedPayload(
+    val encryptionMode: PayloadEncryptionMode = PayloadEncryptionMode.TRANSPORT_SESSION,
+    val senderEphemeralPubKey: ByteArray = ByteArray(0),
     val nonce: ByteArray,
     val ciphertext: ByteArray,
     val authenticationTag: ByteArray
@@ -38,13 +55,17 @@ data class EncryptedPayload(
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is EncryptedPayload) return false
-        return nonce.contentEquals(other.nonce) &&
+        return encryptionMode == other.encryptionMode &&
+            senderEphemeralPubKey.contentEquals(other.senderEphemeralPubKey) &&
+            nonce.contentEquals(other.nonce) &&
             ciphertext.contentEquals(other.ciphertext) &&
             authenticationTag.contentEquals(other.authenticationTag)
     }
 
     override fun hashCode(): Int {
-        var result = nonce.contentHashCode()
+        var result = encryptionMode.hashCode()
+        result = 31 * result + senderEphemeralPubKey.contentHashCode()
+        result = 31 * result + nonce.contentHashCode()
         result = 31 * result + ciphertext.contentHashCode()
         result = 31 * result + authenticationTag.contentHashCode()
         return result
@@ -69,6 +90,8 @@ data class MessageEnvelope(
     val ttl: Int get() = routingMetadata.ttl
     val hopCount: Int get() = routingMetadata.hopCount
 
+    val encryptionMode: PayloadEncryptionMode get() = encryptedPayload.encryptionMode
+    val senderEphemeralPubKey: ByteArray get() = encryptedPayload.senderEphemeralPubKey
     val nonce: ByteArray get() = encryptedPayload.nonce
     val ciphertext: ByteArray get() = encryptedPayload.ciphertext
     val authenticationTag: ByteArray get() = encryptedPayload.authenticationTag
@@ -78,21 +101,27 @@ data class MessageEnvelope(
 
     /**
      * Binds immutable end-to-end envelope fields into AES-GCM Additional Authenticated Data.
-     * Mutable hop-by-hop fields ([ttl], [hopCount]) are excluded so relay nodes can update them
-     * without breaking end-to-end payload integrity at [destinationDeviceId].
+     * Mutable hop-by-hop fields ([ttl], [hopCount]) are intentionally excluded so relay nodes
+     * can update them without invalidating end-to-end AEAD authentication at [destinationDeviceId].
+     * (Accordingly, [ttl] and [hopCount] are not cryptographically authenticated across relays in Phase 2.2.)
      */
     fun buildAdditionalAuthenticatedData(): ByteArray {
         val msgIdBytes = messageId.toByteArray(StandardCharsets.UTF_8)
         val senderBytes = senderDeviceId.toByteArray(StandardCharsets.UTF_8)
         val destinationBytes = destinationDeviceId.toByteArray(StandardCharsets.UTF_8)
+        val ephKeyBytes = encryptedPayload.senderEphemeralPubKey
         val buffer = ByteBuffer.allocate(
-            4 + 8 +
+            4 + 8 + 1 +
+                4 + ephKeyBytes.size +
                 4 + msgIdBytes.size +
                 4 + senderBytes.size +
                 4 + destinationBytes.size
         )
         buffer.putInt(protocolVersion)
         buffer.putLong(createdAt)
+        buffer.put(encryptedPayload.encryptionMode.code)
+        buffer.putInt(ephKeyBytes.size)
+        buffer.put(ephKeyBytes)
         buffer.putInt(msgIdBytes.size)
         buffer.put(msgIdBytes)
         buffer.putInt(senderBytes.size)
@@ -109,6 +138,8 @@ data class MessageEnvelope(
         const val MAX_HOP_COUNT = 32
         const val NONCE_SIZE_BYTES = 12
         const val AUTH_TAG_SIZE_BYTES = 16
+        const val MIN_EPHEMERAL_PUB_KEY_BYTES = 32
+        const val MAX_EPHEMERAL_PUB_KEY_BYTES = 512
         private const val MAX_STRING_BYTES = 256
         private const val MAX_CIPHERTEXT_BYTES = 65_536
 
@@ -122,6 +153,8 @@ data class MessageEnvelope(
             protocolVersion: Int = CURRENT_PROTOCOL_VERSION,
             ttl: Int = DEFAULT_TTL,
             hopCount: Int = 0,
+            encryptionMode: PayloadEncryptionMode = PayloadEncryptionMode.TRANSPORT_SESSION,
+            senderEphemeralPubKey: ByteArray = ByteArray(0),
             nonce: ByteArray,
             ciphertext: ByteArray,
             authenticationTag: ByteArray
@@ -137,6 +170,8 @@ data class MessageEnvelope(
                     hopCount = hopCount
                 ),
                 encryptedPayload = EncryptedPayload(
+                    encryptionMode = encryptionMode,
+                    senderEphemeralPubKey = senderEphemeralPubKey,
                     nonce = nonce,
                     ciphertext = ciphertext,
                     authenticationTag = authenticationTag
@@ -148,9 +183,18 @@ data class MessageEnvelope(
             val msgIdBytes = envelope.messageId.toByteArray(StandardCharsets.UTF_8)
             val senderBytes = envelope.senderDeviceId.toByteArray(StandardCharsets.UTF_8)
             val destBytes = envelope.destinationDeviceId.toByteArray(StandardCharsets.UTF_8)
+            val ephKeyBytes = envelope.senderEphemeralPubKey
             require(msgIdBytes.size in 1..MAX_STRING_BYTES) { "Invalid messageId length" }
             require(senderBytes.size in 1..MAX_STRING_BYTES) { "Invalid senderDeviceId length" }
             require(destBytes.size in 1..MAX_STRING_BYTES) { "Invalid destinationDeviceId length" }
+            when (envelope.encryptionMode) {
+                PayloadEncryptionMode.TRANSPORT_SESSION ->
+                    require(ephKeyBytes.isEmpty()) { "TRANSPORT_SESSION must not carry E2E ephemeral key" }
+                PayloadEncryptionMode.END_TO_END ->
+                    require(ephKeyBytes.size in MIN_EPHEMERAL_PUB_KEY_BYTES..MAX_EPHEMERAL_PUB_KEY_BYTES) {
+                        "Invalid E2E ephemeral public key length"
+                    }
+            }
             require(envelope.nonce.size == NONCE_SIZE_BYTES) { "Nonce must be 12 bytes" }
             require(envelope.authenticationTag.size == AUTH_TAG_SIZE_BYTES) { "Auth tag must be 16 bytes" }
             require(envelope.ciphertext.size <= MAX_CIPHERTEXT_BYTES) { "Ciphertext exceeds max size" }
@@ -159,6 +203,8 @@ data class MessageEnvelope(
                 8 + // createdAt
                 4 + // ttl
                 4 + // hopCount
+                1 + // encryptionMode
+                2 + ephKeyBytes.size +
                 2 + msgIdBytes.size +
                 2 + senderBytes.size +
                 2 + destBytes.size +
@@ -171,6 +217,8 @@ data class MessageEnvelope(
             buffer.putLong(envelope.createdAt)
             buffer.putInt(envelope.ttl)
             buffer.putInt(envelope.hopCount)
+            buffer.put(envelope.encryptionMode.code)
+            putShortPrefixed(buffer, ephKeyBytes)
             putShortPrefixed(buffer, msgIdBytes)
             putShortPrefixed(buffer, senderBytes)
             putShortPrefixed(buffer, destBytes)
@@ -183,12 +231,20 @@ data class MessageEnvelope(
 
         fun deserialize(bytes: ByteArray): MessageEnvelope? {
             return try {
-                if (bytes.size < 34) return null
+                if (bytes.size < 37) return null
                 val buffer = ByteBuffer.wrap(bytes)
                 val version = buffer.int
                 val createdAt = buffer.long
                 val ttl = buffer.int
                 val hopCount = buffer.int
+                if (buffer.remaining() < 1) return null
+                val encryptionMode = PayloadEncryptionMode.fromCode(buffer.get()) ?: return null
+                val ephKeyBytes = readShortPrefixed(buffer, 0..MAX_EPHEMERAL_PUB_KEY_BYTES) ?: return null
+                when (encryptionMode) {
+                    PayloadEncryptionMode.TRANSPORT_SESSION -> if (ephKeyBytes.isNotEmpty()) return null
+                    PayloadEncryptionMode.END_TO_END ->
+                        if (ephKeyBytes.size !in MIN_EPHEMERAL_PUB_KEY_BYTES..MAX_EPHEMERAL_PUB_KEY_BYTES) return null
+                }
                 val msgIdBytes = readShortPrefixed(buffer, 1..MAX_STRING_BYTES) ?: return null
                 val senderBytes = readShortPrefixed(buffer, 1..MAX_STRING_BYTES) ?: return null
                 val destBytes = readShortPrefixed(buffer, 1..MAX_STRING_BYTES) ?: return null
@@ -209,6 +265,8 @@ data class MessageEnvelope(
                     protocolVersion = version,
                     ttl = ttl,
                     hopCount = hopCount,
+                    encryptionMode = encryptionMode,
+                    senderEphemeralPubKey = ephKeyBytes,
                     nonce = nonce,
                     ciphertext = ciphertext,
                     authenticationTag = tag

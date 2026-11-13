@@ -68,6 +68,25 @@ class DeviceIdentityManager(context: Context) {
         return sig.sign()
     }
 
+    /**
+     * Computes a raw ECDH P-256 shared secret between this device's long-term identity private key
+     * and [peerPublicKeyEncoded] (X.509 EC public key). Keeps the private key encapsulated inside
+     * [DeviceIdentityManager].
+     */
+    fun performIdentityEcdh(peerPublicKeyEncoded: ByteArray): ByteArray? {
+        if (peerPublicKeyEncoded.size !in 32..512) return null
+        return try {
+            val kf = KeyFactory.getInstance("EC")
+            val peerPublicKey = kf.generatePublic(X509EncodedKeySpec(peerPublicKeyEncoded))
+            val ka = javax.crypto.KeyAgreement.getInstance("ECDH")
+            ka.init(keyPair.private)
+            ka.doPhase(peerPublicKey, true)
+            ka.generateSecret()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun loadOrCreateDeviceId(): String {
         val existing = prefs.getString(KEY_DEVICE_ID, null)
         if (!existing.isNullOrBlank()) {

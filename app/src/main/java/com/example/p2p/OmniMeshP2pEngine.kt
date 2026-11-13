@@ -5,6 +5,7 @@ import com.example.p2p.crypto.HandshakeAckPacket
 import com.example.p2p.crypto.HandshakeInitPacket
 import com.example.p2p.crypto.MessageEnvelope
 import com.example.p2p.crypto.OmniMeshCrypto
+import com.example.p2p.crypto.PayloadEncryptionMode
 import com.example.p2p.crypto.PendingClientHandshake
 import com.example.p2p.crypto.SecureSession
 import com.example.p2p.crypto.SessionState
@@ -32,6 +33,7 @@ import com.example.p2p.transport.TransportResult
 import com.example.p2p.transport.TransportType
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -82,7 +84,8 @@ class OmniMeshP2pEngine(
     private val capabilityDetector: CapabilityDetector,
     private val clock: () -> Long = { System.currentTimeMillis() },
     duplicateCache: DuplicateMessageCache? = null,
-    nextHopResolver: NextHopResolver? = null
+    nextHopResolver: NextHopResolver? = null,
+    private val peerIdentityKeyResolver: (suspend (String) -> ByteArray?)? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val handshakeMutex = Mutex()
@@ -119,12 +122,12 @@ class OmniMeshP2pEngine(
     )
 
     init {
-        scope.launch {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
             primaryTransport.events.collect { event ->
                 handleTransportEvent(event)
             }
         }
-        scope.launch {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
             primaryTransport.receive().collect { frame ->
                 handleIncomingFrame(frame.peerAddress.uppercase(), frame.payload)
             }
@@ -333,6 +336,88 @@ class OmniMeshP2pEngine(
         }
     }
 
+    /**
+     * Encrypts [plaintext] End-to-End for [destinationDeviceId] (P-256 ECDH + HKDF-SHA256 + AES-256-GCM)
+     * so intermediate relay nodes can inspect [RoutingMetadata] and forward the packet without ever
+     * accessing plaintext or E2E message keys.
+     */
+    suspend fun sendEndToEndMessage(
+        destinationDeviceId: String,
+        plaintext: String,
+        nextHopAddress: String? = null,
+        destinationIdentityPubKey: ByteArray? = null,
+        ttl: Int = MessageEnvelope.DEFAULT_TTL
+    ): TransportResult<String> {
+        val trimmed = plaintext.trim()
+        if (trimmed.isEmpty()) {
+            return TransportResult.Failure("Boş mesaj gönderilemez.")
+        }
+        if (destinationDeviceId.isBlank() || destinationDeviceId == identityManager.deviceId) {
+            return TransportResult.Failure("Geçersiz hedef cihaz kimliği.")
+        }
+
+        val targetIdentityPubKey = destinationIdentityPubKey ?: resolveTrustedIdentityKey(destinationDeviceId)
+            ?: return TransportResult.Failure("Hedef cihazın doğrulanmış kimlik anahtarı bulunamadı.")
+
+        val hopAddress = (nextHopAddress ?: deviceIdToAddress[destinationDeviceId])?.uppercase()
+            ?: return TransportResult.Failure("Sonraki durak adresi bulunamadı.")
+
+        val messageId = MessageEnvelope.newMessageId()
+        localRepository.createOutgoingMessage(
+            messageId = messageId,
+            peerDeviceId = destinationDeviceId,
+            senderDeviceId = identityManager.deviceId,
+            plaintext = trimmed
+        )
+
+        val hopDeviceId = addressToDeviceId[hopAddress]
+        if (hopDeviceId == null || sessionsByDeviceId[hopDeviceId] == null) {
+            localRepository.updateMessageState(messageId, MessageDeliveryState.CONNECTING)
+            when (val hsRes = connectAndEstablishSession(hopAddress)) {
+                is TransportResult.Failure -> {
+                    localRepository.updateMessageState(messageId, MessageDeliveryState.FAILED, hsRes.reason)
+                    return hsRes
+                }
+                is TransportResult.Success -> Unit
+            }
+        }
+
+        val envelope = crypto.encryptEndToEndEnvelope(
+            destinationDeviceId = destinationDeviceId,
+            destinationIdentityPubKey = targetIdentityPubKey,
+            plaintext = trimmed.toByteArray(StandardCharsets.UTF_8),
+            messageId = messageId,
+            createdAt = clock(),
+            ttl = ttl
+        )
+        val wireFrame = byteArrayOf(FRAME_DATA_ENVELOPE) + MessageEnvelope.serialize(envelope)
+        return when (val res = primaryTransport.send(hopAddress, wireFrame)) {
+            is TransportResult.Success -> {
+                localRepository.updateMessageState(messageId, MessageDeliveryState.SENT)
+                _engineState.update { it.copy(statusMessage = "Uçtan uca şifreli mesaj gönderildi") }
+                TransportResult.Success(messageId)
+            }
+            is TransportResult.Failure -> {
+                localRepository.updateMessageState(messageId, MessageDeliveryState.FAILED, res.reason)
+                TransportResult.Failure(res.reason)
+            }
+        }
+    }
+
+    private suspend fun resolveTrustedIdentityKey(deviceId: String): ByteArray? {
+        sessionsByDeviceId[deviceId]?.peerIdentityPubKey?.let { return it }
+        val savedB64 = localRepository.getPeerByDeviceId(deviceId)?.identityPublicKeyB64
+        if (!savedB64.isNullOrBlank()) {
+            val decoded = runCatching {
+                android.util.Base64.decode(savedB64, android.util.Base64.NO_WRAP)
+            }.getOrNull()
+            if (decoded != null && decoded.isNotEmpty()) {
+                return decoded
+            }
+        }
+        return peerIdentityKeyResolver?.invoke(deviceId)
+    }
+
     private suspend fun transmitEnvelope(
         address: String,
         session: SecureSession,
@@ -533,44 +618,85 @@ class OmniMeshP2pEngine(
 
         when (val decision = forwardingEngine.processIncoming(envelope, incomingPeerAddress = peerAddress)) {
             is ForwardingDecision.LocalDelivery -> {
-                val devId = addressToDeviceId[peerAddress]
-                val session = sessionsByDeviceId[decision.envelope.senderDeviceId]
-                    ?: devId?.let { sessionsByDeviceId[it] }
-                    ?: run {
-                        _engineState.update {
-                            it.copy(lastSecurityNotice = "INVALID_MESSAGE: Aktif güvenli oturum yok")
+                val targetEnvelope = decision.envelope
+                when (targetEnvelope.encryptionMode) {
+                    PayloadEncryptionMode.END_TO_END -> {
+                        val trustedSenderKey = resolveTrustedIdentityKey(targetEnvelope.senderDeviceId)
+                        when (val result = crypto.decryptAndVerifyE2eEnvelope(targetEnvelope, trustedSenderKey, localRepository)) {
+                            is EnvelopeVerificationResult.Valid -> {
+                                forwardingEngine.markLocalDelivered(targetEnvelope.messageId)
+                                val text = String(result.plaintext, StandardCharsets.UTF_8)
+                                localRepository.saveIncomingMessage(
+                                    messageId = targetEnvelope.messageId,
+                                    senderDeviceId = targetEnvelope.senderDeviceId,
+                                    receiverDeviceId = targetEnvelope.destinationDeviceId,
+                                    plaintext = text,
+                                    timestamp = targetEnvelope.createdAt
+                                )
+                                sessionsByDeviceId[targetEnvelope.senderDeviceId]?.let { directSession ->
+                                    sendEncryptedDeliveryAck(peerAddress, directSession, targetEnvelope.messageId)
+                                }
+                                _engineState.update { it.copy(statusMessage = "Yeni uçtan uca şifreli mesaj alındı") }
+                            }
+                            is EnvelopeVerificationResult.InvalidMessage -> {
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "INVALID_MESSAGE: ${result.reason}")
+                                }
+                            }
+                            is EnvelopeVerificationResult.ReplayDetected -> {
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "REPLAY_DETECTED: Tekrarlanan mesaj reddedildi")
+                                }
+                            }
+                            is EnvelopeVerificationResult.Expired -> {
+                                localRepository.updateMessageState(result.messageId, MessageDeliveryState.EXPIRED, "Zaman aşımı")
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "EXPIRED: Süresi dolmuş paket reddedildi")
+                                }
+                            }
                         }
-                        return
                     }
+                    PayloadEncryptionMode.TRANSPORT_SESSION -> {
+                        val devId = addressToDeviceId[peerAddress]
+                        val session = sessionsByDeviceId[targetEnvelope.senderDeviceId]
+                            ?: devId?.let { sessionsByDeviceId[it] }
+                            ?: run {
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "INVALID_MESSAGE: Aktif güvenli oturum yok")
+                                }
+                                return
+                            }
 
-                when (val result = crypto.decryptAndVerifyEnvelope(session, decision.envelope, localRepository)) {
-                    is EnvelopeVerificationResult.Valid -> {
-                        forwardingEngine.markLocalDelivered(decision.envelope.messageId)
-                        val text = String(result.plaintext, StandardCharsets.UTF_8)
-                        localRepository.saveIncomingMessage(
-                            messageId = decision.envelope.messageId,
-                            senderDeviceId = decision.envelope.senderDeviceId,
-                            receiverDeviceId = decision.envelope.destinationDeviceId,
-                            plaintext = text,
-                            timestamp = decision.envelope.createdAt
-                        )
-                        sendEncryptedDeliveryAck(peerAddress, session, decision.envelope.messageId)
-                        _engineState.update { it.copy(statusMessage = "Yeni şifreli mesaj alındı") }
-                    }
-                    is EnvelopeVerificationResult.InvalidMessage -> {
-                        _engineState.update {
-                            it.copy(lastSecurityNotice = "INVALID_MESSAGE: ${result.reason}")
-                        }
-                    }
-                    is EnvelopeVerificationResult.ReplayDetected -> {
-                        _engineState.update {
-                            it.copy(lastSecurityNotice = "REPLAY_DETECTED: Tekrarlanan mesaj reddedildi")
-                        }
-                    }
-                    is EnvelopeVerificationResult.Expired -> {
-                        localRepository.updateMessageState(result.messageId, MessageDeliveryState.EXPIRED, "Zaman aşımı")
-                        _engineState.update {
-                            it.copy(lastSecurityNotice = "EXPIRED: Süresi dolmuş paket reddedildi")
+                        when (val result = crypto.decryptAndVerifyEnvelope(session, targetEnvelope, localRepository)) {
+                            is EnvelopeVerificationResult.Valid -> {
+                                forwardingEngine.markLocalDelivered(targetEnvelope.messageId)
+                                val text = String(result.plaintext, StandardCharsets.UTF_8)
+                                localRepository.saveIncomingMessage(
+                                    messageId = targetEnvelope.messageId,
+                                    senderDeviceId = targetEnvelope.senderDeviceId,
+                                    receiverDeviceId = targetEnvelope.destinationDeviceId,
+                                    plaintext = text,
+                                    timestamp = targetEnvelope.createdAt
+                                )
+                                sendEncryptedDeliveryAck(peerAddress, session, targetEnvelope.messageId)
+                                _engineState.update { it.copy(statusMessage = "Yeni şifreli mesaj alındı") }
+                            }
+                            is EnvelopeVerificationResult.InvalidMessage -> {
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "INVALID_MESSAGE: ${result.reason}")
+                                }
+                            }
+                            is EnvelopeVerificationResult.ReplayDetected -> {
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "REPLAY_DETECTED: Tekrarlanan mesaj reddedildi")
+                                }
+                            }
+                            is EnvelopeVerificationResult.Expired -> {
+                                localRepository.updateMessageState(result.messageId, MessageDeliveryState.EXPIRED, "Zaman aşımı")
+                                _engineState.update {
+                                    it.copy(lastSecurityNotice = "EXPIRED: Süresi dolmuş paket reddedildi")
+                                }
+                            }
                         }
                     }
                 }
